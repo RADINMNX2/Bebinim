@@ -26,10 +26,45 @@ const DEFAULT_STUN_SERVERS = [
   { urls: 'stun:global.stun.twilio.com:3478' }
 ];
 
+// --- Xirsys TURN (free tier) ---
+// Credentials are fetched at runtime via the Xirsys API so they can be rotated
+// from the Xirsys dashboard without rebuilding the app. Used only as a fallback
+// when direct P2P fails; if the TURN server is unreachable, WebRTC keeps working
+// over STUN/P2P (graceful degradation).
+const XIRSYS = {
+  ident: 'RADINMNX',
+  secret: '25a5cd9e-98ec-11f1-8480-cafcf9cf945e',
+  channel: 'mnx-bebinim'
+};
+const XIRSYS_TTL_MS = 30 * 60 * 1000; // Refresh cached TURN creds every 30min
+let xirsysCache = null;
+
+const fetchXirsysTurn = async () => {
+  if (xirsysCache && Date.now() - xirsysCache.fetchedAt < XIRSYS_TTL_MS) {
+    return xirsysCache.servers;
+  }
+  try {
+    const auth = btoa(`${XIRSYS.ident}:${XIRSYS.secret}`);
+    const res = await fetch(`https://global.xirsys.net/_turn/${XIRSYS.channel}?webrtc=1&expire=21600`, {
+      method: 'PUT',
+      headers: { Authorization: `Basic ${auth}` },
+      signal: AbortSignal.timeout(4000)
+    });
+    if (!res.ok) return null;
+    const data = await res.json();
+    if (data?.s !== 'ok' || !data?.v?.iceServers?.length) return null;
+    xirsysCache = { servers: data.v.iceServers, fetchedAt: Date.now() };
+    return data.v.iceServers;
+  } catch (_) {
+    return null;
+  }
+};
+
 // --- Connection config from the URL (no rebuild needed) ---
 // ?sig=ws://host:port        -> custom signaling server (PeerJS server, your PC or VPS)
 // ?turn=turn:host:port:user:pass -> add a TURN relay (Metered Open Relay, Xirsys, coturn...)
 // Both get embedded automatically into every invite link, so guests join the same network.
+// Without ?turn=, the built-in Xirsys free TURN is fetched automatically at runtime.
 const getUrlParams = () => new URLSearchParams(window.location.search);
 
 const buildPeerConfig = () => {
@@ -101,6 +136,7 @@ export const Room = ({ roomId, userName, isHost, onLeave }) => {
   const [isShareModalOpen, setIsShareModalOpen] = useState(false);
   const [reactions, setReactions] = useState([]); // Floating reactions
   const [isCopied, setIsCopied] = useState(false);
+  const [xirsysTurnActive, setXirsysTurnActive] = useState(false);
 
   const videoRef = useRef(null);
   const peerRef = useRef(null);
@@ -130,33 +166,54 @@ export const Room = ({ roomId, userName, isHost, onLeave }) => {
       ? `bebinim-host-${roomId}`
       : `bebinim-guest-${roomId}-${Math.random().toString(36).substring(2, 6)}`;
 
-    const p = new Peer(peerId, PEER_CONFIG);
-    peerRef.current = p;
+    let cancelled = false;
+    const initPeer = async () => {
+      const config = {
+        ...PEER_CONFIG,
+        config: { ...PEER_CONFIG.config, iceServers: [...PEER_CONFIG.config.iceServers] }
+      };
 
-    p.on('open', (id) => {
-      console.log('Peer connected with ID:', id);
-      if (isHost) {
-        addToast(`اتاق ایجاد شد. کد اتاق: ${roomId}`, 'success');
-      } else {
-        addToast('در حال اتصال به میزبان...', 'info');
-        connectToHost(p, `bebinim-host-${roomId}`, 1);
+      // Auto-TURN: unless an explicit ?turn= relay was given, try Xirsys free TURN
+      if (!ACTIVE_TURN) {
+        const turnServers = await fetchXirsysTurn();
+        if (cancelled) return;
+        if (turnServers) {
+          config.config.iceServers.push(...turnServers);
+          setXirsysTurnActive(true);
+        }
       }
-    });
 
-    p.on('connection', (conn) => {
-      setupConnection(conn, 1);
-    });
+      const p = new Peer(peerId, config);
+      peerRef.current = p;
 
-    p.on('error', (err) => {
-      console.error('Peer error:', err);
-      if (err.type !== 'peer-unavailable') {
-        addToast(`خطای اتصال P2P: ${err.type || err.message}`, 'error');
-      }
-    });
+      p.on('open', (id) => {
+        console.log('Peer connected with ID:', id);
+        if (isHost) {
+          addToast(`اتاق ایجاد شد. کد اتاق: ${roomId}`, 'success');
+        } else {
+          addToast('در حال اتصال به میزبان...', 'info');
+          connectToHost(p, `bebinim-host-${roomId}`, 1);
+        }
+      });
+
+      p.on('connection', (conn) => {
+        setupConnection(conn, 1);
+      });
+
+      p.on('error', (err) => {
+        console.error('Peer error:', err);
+        if (err.type !== 'peer-unavailable') {
+          addToast(`خطای اتصال P2P: ${err.type || err.message}`, 'error');
+        }
+      });
+    };
+
+    initPeer();
 
     return () => {
+      cancelled = true;
       connectionsRef.current = [];
-      p.destroy();
+      if (peerRef.current) peerRef.current.destroy();
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [roomId]);
@@ -850,8 +907,12 @@ export const Room = ({ roomId, userName, isHost, onLeave }) => {
             </div>
             <div className="flex items-center justify-between">
               <span>turn relay</span>
-              <span className={ACTIVE_TURN ? 'text-emerald-400' : 'text-gray-500'}>
-                {ACTIVE_TURN ? ACTIVE_TURN.split(':')[1] + ':' + ACTIVE_TURN.split(':')[2] : 'خاموش (فقط P2P)'}
+              <span className={ACTIVE_TURN || xirsysTurnActive ? 'text-emerald-400' : 'text-gray-500'}>
+                {ACTIVE_TURN
+                  ? ACTIVE_TURN.split(':')[1] + ':' + ACTIVE_TURN.split(':')[2]
+                  : xirsysTurnActive
+                    ? 'xirsys (خودکار)'
+                    : 'خاموش (فقط P2P)'}
               </span>
             </div>
           </div>
