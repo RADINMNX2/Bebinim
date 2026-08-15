@@ -1,7 +1,14 @@
 // Minimal Matroska in-band subtitle extractor (no WASM / no external player).
 // Extracts embedded subtitle tracks (S_TEXT/UTF8, S_TEXT/ASS, S_TEXT/SSA) so
 // they can be rendered with our custom subtitle overlay.
-import { tools } from 'ebml';
+// Lazy-loaded to avoid Node require() in browser bundle
+let toolsCache = null;
+const getTools = async () => {
+  if (toolsCache) return toolsCache;
+  const mod = await import('ebml');
+  toolsCache = mod.tools;
+  return toolsCache;
+};
 
 const findChild = (children, name) =>
   children && children.find((c) => c.name === name);
@@ -47,6 +54,7 @@ const decodeBlockText = (data, codecId) => {
 };
 
 export const extractMkvSubtitles = async (arrayBuffer) => {
+  const tools = await getTools();
   const tree = await tools.readAll(new Uint8Array(arrayBuffer));
   const segment = tree.find((e) => e.name === 'Segment');
   if (!segment || !segment.children) throw new Error('Segment یافت نشد');
