@@ -277,3 +277,53 @@ input[type="range"].neon-range::-moz-range-thumb {
 .clip-path-hexagon {
   clip-path: polygon(50% 0%, 100% 25%, 100% 75%, 50% 100%, 0% 75%, 0% 25%);
 }
+
+/* ============ GPU / Skia Rendering Optimizations ============ */
+/* Promote animated elements to their own compositor layers so the browser
+   (Chromium renders with Skia) rasterizes and composites them on the GPU
+   instead of repainting on the CPU every frame. */
+.gpu-layer {
+  transform: translateZ(0);
+  will-change: transform;
+  backface-visibility: hidden;
+}
+
+/* Contain the chat list so scrolling never forces a full-page repaint */
+.chat-scroll {
+  contain: content;
+  overscroll-behavior: contain;
+}
+
+video {
+  background: #000;
+}
+
+/* TVs / touch devices have no hover: keep the video controls always visible */
+@media (pointer: coarse) {
+  .overlay-coarse {
+    opacity: 1 !important;
+  }
+  input[type="range"].neon-range {
+    height: 10px;
+  }
+  input[type="range"].neon-range::-webkit-slider-thumb {
+    width: 22px;
+    height: 22px;
+  }
+}
+
+/* Large TV screens (4K): scale the whole rem-based UI up smoothly */
+@media (min-width: 1920px) {
+  html {
+    font-size: 18px;
+  }
+}
+
+/* Respect users who prefer reduced motion (accessibility + CPU saving) */
+@media (prefers-reduced-motion: reduce) {
+  *, *::before, *::after {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+  }
+}

@@ -247,6 +247,8 @@ export const Landing = ({ onJoinRoom, inviteRoomId }) => {
         {/* Footer info */}
         <div className="text-center mt-6 text-xs text-gray-500 font-persian">
           طراحی شده با عشق • پشتیبانی از قابلیت‌های مدرن WebRTC P2P
+          <br />
+          ساخته شده توسط <span className="text-red-500 font-bold">RADINMNX</span>
         </div>
       </div>
     </div>
