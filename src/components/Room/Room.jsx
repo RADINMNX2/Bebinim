@@ -15,24 +15,62 @@ const SAMPLE_VIDEOS = [
   { title: 'Sintel (ماجراجویی)', url: 'https://commondatastorage.googleapis.com/gtv-videos-bucket/sample/Sintel.mp4' }
 ];
 
-// Multiple STUN servers to maximize NAT traversal success inside Iran
-const PEER_CONFIG = {
-  host: '0.peerjs.com',
-  port: 443,
-  secure: true,
-  config: {
-    iceServers: [
-      { urls: 'stun:stun.l.google.com:19302' },
-      { urls: 'stun:stun1.l.google.com:19302' },
-      { urls: 'stun:stun2.l.google.com:19302' },
-      { urls: 'stun:stun.cloudflare.com:3478' },
-      { urls: 'stun:stun.services.mozilla.com' },
-      { urls: 'stun:stun.1und1.de:3478' },
-      { urls: 'stun:global.stun.twilio.com:3478' }
-    ]
-  },
-  debug: 1
+// Default free STUN servers to maximize NAT traversal success inside Iran
+const DEFAULT_STUN_SERVERS = [
+  { urls: 'stun:stun.l.google.com:19302' },
+  { urls: 'stun:stun1.l.google.com:19302' },
+  { urls: 'stun:stun2.l.google.com:19302' },
+  { urls: 'stun:stun.cloudflare.com:3478' },
+  { urls: 'stun:stun.services.mozilla.com' },
+  { urls: 'stun:stun.1und1.de:3478' },
+  { urls: 'stun:global.stun.twilio.com:3478' }
+];
+
+// --- Connection config from the URL (no rebuild needed) ---
+// ?sig=ws://host:port        -> custom signaling server (PeerJS server, your PC or VPS)
+// ?turn=turn:host:port:user:pass -> add a TURN relay (Metered Open Relay, Xirsys, coturn...)
+// Both get embedded automatically into every invite link, so guests join the same network.
+const getUrlParams = () => new URLSearchParams(window.location.search);
+
+const buildPeerConfig = () => {
+  const iceServers = [...DEFAULT_STUN_SERVERS];
+
+  const turnParam = getUrlParams().get('turn');
+  if (turnParam) {
+    const parts = turnParam.split(':');
+    const username = parts[parts.length - 2];
+    const credential = parts[parts.length - 1];
+    const turnUrl = parts.slice(0, parts.length - 2).join(':');
+    if (turnUrl.startsWith('turn:') || turnUrl.startsWith('turns:')) {
+      iceServers.push({ urls: turnUrl, username, credential });
+    }
+  }
+
+  const config = {
+    host: '0.peerjs.com',
+    port: 443,
+    secure: true,
+    config: { iceServers },
+    debug: 1
+  };
+
+  const sigParam = getUrlParams().get('sig');
+  if (sigParam) {
+    try {
+      const u = new URL(sigParam.includes('://') ? sigParam : `ws://${sigParam}`);
+      config.host = u.hostname;
+      config.port = u.port ? Number(u.port) : (u.protocol === 'wss:' ? 443 : 9000);
+      config.secure = u.protocol === 'wss:';
+    } catch (_) {
+      // malformed sig -> fall back to PeerJS Cloud
+    }
+  }
+  return config;
 };
+
+const PEER_CONFIG = buildPeerConfig();
+const ACTIVE_SIGNALING = getUrlParams().get('sig') || '0.peerjs.com';
+const ACTIVE_TURN = getUrlParams().get('turn') || null;
 
 // Sync tuning parameters
 const SYNC_INTERVAL_MS = 4000;        // Host broadcasts full state every 4s
@@ -442,6 +480,10 @@ export const Room = ({ roomId, userName, isHost, onLeave }) => {
       ? 'در انتظار مهمان‌ها...'
       : 'در حال برقراری اتصال P2P...';
 
+  const signalingHost = ACTIVE_SIGNALING.includes('://')
+    ? new URL(ACTIVE_SIGNALING).host
+    : ACTIVE_SIGNALING;
+
   return (
     <div className="h-screen flex flex-col bg-black text-gray-100 relative overflow-x-hidden">
       {/* Top Navbar */}
@@ -799,6 +841,19 @@ export const Room = ({ roomId, userName, isHost, onLeave }) => {
 
           <div className="text-center pt-2">
             <span className="text-xs text-gray-500 font-mono">کد یکتای اتاق: <strong className="text-red-400">{roomId}</strong></span>
+          </div>
+
+          <div className="rounded-xl bg-black/40 border border-white/5 p-3 space-y-1.5 text-[11px] font-mono text-gray-400" dir="ltr">
+            <div className="flex items-center justify-between">
+              <span>signaling</span>
+              <span className="text-emerald-400">{signalingHost}</span>
+            </div>
+            <div className="flex items-center justify-between">
+              <span>turn relay</span>
+              <span className={ACTIVE_TURN ? 'text-emerald-400' : 'text-gray-500'}>
+                {ACTIVE_TURN ? ACTIVE_TURN.split(':')[1] + ':' + ACTIVE_TURN.split(':')[2] : 'خاموش (فقط P2P)'}
+              </span>
+            </div>
           </div>
         </div>
       </Modal>
