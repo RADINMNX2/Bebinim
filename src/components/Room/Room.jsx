@@ -4,7 +4,7 @@ import {
   Play, Pause, Volume2, VolumeX, Maximize, Minimize, Share2, Users, MessageSquare,
   Send, Link as LinkIcon, Film, LogOut, Check, Radio, Wifi, RefreshCw,
   Crown, Shield, ShieldOff, UserX, Settings, Loader2, Rewind, FastForward,
-  Subtitles, PictureInPicture, Languages, X
+  Subtitles, PictureInPicture, Languages, X, SlidersHorizontal, Palette, Type, Minus, Plus
 } from 'lucide-react';
 import { useToast } from '../../context/ToastContext';
 import { Modal } from '../UI/Modal';
@@ -181,6 +181,19 @@ export const Room = ({ roomId, userName, isHost, onLeave }) => {
   const [mkvLoading, setMkvLoading] = useState(false);
   const [mkvError, setMkvError] = useState('');
 
+  // Subtitle settings
+  const [subtitleSettings, setSubtitleSettings] = useState({
+    fontSize: 20,
+    fontColor: '#ffffff',
+    backgroundColor: 'rgba(0, 0, 0, 0.7)',
+    backgroundBlur: 4,
+    verticalOffset: 24, // bottom offset in px
+    fontFamily: 'inherit',
+    textShadow: true,
+  });
+  const [subtitleModalOpen, setSubtitleModalOpen] = useState(false);
+  const [chatModalOpen, setChatModalOpen] = useState(false);
+
   // Controls direction (RTL / LTR)
   const [controlsDir, setControlsDir] = useState('rtl');
 
@@ -227,6 +240,7 @@ export const Room = ({ roomId, userName, isHost, onLeave }) => {
   const hideTimerRef = useRef(null);
   const pendingPlayRef = useRef(null);
   const inPlayerChatScrollRef = useRef(null);
+  const chatModalScrollRef = useRef(null);
   const isFullscreenRef = useRef(false);
   isFullscreenRef.current = isFullscreen;
   const chatOpenRef = useRef(false);
@@ -580,9 +594,9 @@ export const Room = ({ roomId, userName, isHost, onLeave }) => {
 
       case 'CHAT_MESSAGE':
         setMessages((prev) => [...prev, { sender: data.sender, text: data.text, time: data.time }]);
-        // Auto-open the in-player chat panel in fullscreen, else bump the unread badge
+        // Auto-open the chat modal in fullscreen, else bump the unread badge
         if (isFullscreenRef.current) {
-          setChatOpen(true);
+          setChatModalOpen(true);
           setUnreadChat(0);
         } else if (!chatOpenRef.current) {
           setUnreadChat((n) => n + 1);
@@ -964,17 +978,17 @@ export const Room = ({ roomId, userName, isHost, onLeave }) => {
     };
   }, [showControls]);
 
-  // Clear the unread badge whenever the in-player chat is opened
+  // Clear the unread badge whenever the chat modal is opened
   useEffect(() => {
-    if (chatOpen) setUnreadChat(0);
-  }, [chatOpen]);
+    if (chatModalOpen) setUnreadChat(0);
+  }, [chatModalOpen]);
 
-  // Keep the in-player chat scrolled to the latest message
+  // Keep the chat modal scrolled to the latest message
   useEffect(() => {
-    if (chatOpen && inPlayerChatScrollRef.current) {
-      inPlayerChatScrollRef.current.scrollTop = inPlayerChatScrollRef.current.scrollHeight;
+    if (chatModalOpen && chatModalScrollRef.current) {
+      chatModalScrollRef.current.scrollTop = chatModalScrollRef.current.scrollHeight;
     }
-  }, [messages, chatOpen]);
+  }, [messages, chatModalOpen]);
 
   const enterFullscreen = () => {
     if (!playerWrapRef.current) return;
@@ -1418,8 +1432,31 @@ export const Room = ({ roomId, userName, isHost, onLeave }) => {
 
             {/* Subtitle overlay (custom-rendered, works in fullscreen too) */}
             {subtitleEnabled && subtitleText && !codecError && (
-              <div className="absolute left-1/2 -translate-x-1/2 bottom-24 md:bottom-32 z-[15] pointer-events-none w-[90%] max-w-3xl">
-                <p className="text-center text-base md:text-2xl font-bold text-white subtitle-text leading-relaxed">
+              <div
+                className="absolute left-1/2 -translate-x-1/2 z-[15] pointer-events-none w-[90%] max-w-3xl"
+                style={{
+                  bottom: `${subtitleSettings.verticalOffset}px`,
+                }}
+              >
+                <p
+                  className="text-center leading-relaxed"
+                  style={{
+                    fontSize: `${subtitleSettings.fontSize}px`,
+                    color: subtitleSettings.fontColor,
+                    fontFamily: subtitleSettings.fontFamily,
+                    textShadow: subtitleSettings.textShadow
+                      ? '0 2px 8px rgba(0,0,0,0.8), 0 0 2px rgba(0,0,0,0.9)'
+                      : 'none',
+                    backgroundColor: subtitleSettings.backgroundColor,
+                    backdropFilter: `blur(${subtitleSettings.backgroundBlur}px)`,
+                    WebkitBackdropFilter: `blur(${subtitleSettings.backgroundBlur}px)`,
+                    padding: '8px 16px',
+                    borderRadius: '8px',
+                    display: 'inline-block',
+                    maxWidth: '100%',
+                    wordWrap: 'break-word',
+                  }}
+                >
                   {subtitleText}
                 </p>
               </div>
@@ -1460,17 +1497,17 @@ export const Room = ({ roomId, userName, isHost, onLeave }) => {
                       <span className="hidden md:inline">تغییر ویدیو</span>
                     </button>
                   )}
-                  <button
-                    onClick={() => setChatOpen((o) => !o)}
-                    className={`py-1.5 px-3 text-xs gap-1.5 rounded-xl border transition-colors ${chatOpen ? 'bg-red-600/30 border-red-500/50 text-red-300' : 'bg-black/40 border-white/10 text-gray-300'}`}
-                    title="چت"
-                  >
-                    <MessageSquare className="w-3.5 h-3.5" />
-                    <span className="hidden md:inline">چت</span>
-                    {unreadChat > 0 && (
-                      <span className="px-1.5 py-0.5 text-[9px] bg-red-600 rounded-full">{unreadChat}</span>
-                    )}
-                  </button>
+<button
+                      onClick={() => setChatModalOpen(true)}
+                      className={`py-1.5 px-3 text-xs gap-1.5 rounded-xl border transition-colors ${chatModalOpen ? 'bg-red-600/30 border-red-500/50 text-red-300' : 'bg-black/40 border-white/10 text-gray-300'}`}
+                      title="چت"
+                    >
+                      <MessageSquare className="w-3.5 h-3.5" />
+                      <span className="hidden md:inline">چت</span>
+                      {unreadChat > 0 && (
+                        <span className="px-1.5 py-0.5 text-[9px] bg-red-600 rounded-full">{unreadChat}</span>
+                      )}
+                    </button>
                 </div>
               </div>
 
@@ -1588,11 +1625,11 @@ export const Room = ({ roomId, userName, isHost, onLeave }) => {
                       )}
                     </div>
 
-                    {/* Subtitle toggle */}
+                    {/* Subtitle settings modal */}
                     <button
-                      onClick={() => setSubtitleEnabled((s) => !s)}
+                      onClick={() => setSubtitleModalOpen(true)}
                       disabled={subtitleCues.length === 0}
-                      title="زیرنویس (C)"
+                      title="تنظیمات زیرنویس (C)"
                       className={`p-1.5 transition-colors rounded-lg hover:bg-red-500/10 disabled:opacity-30 ${subtitleEnabled && subtitleCues.length ? 'text-red-400' : 'hover:text-red-400'}`}
                     >
                       <Subtitles className="w-4 h-4 md:w-5 md:h-5" />
@@ -1636,53 +1673,6 @@ export const Room = ({ roomId, userName, isHost, onLeave }) => {
                 </div>
               </div>
             </div>
-
-            {/* In-player Chat panel (fullscreen side panel, outside the overlay so it doesn't auto-hide) */}
-            {chatOpen && (
-              <div className="absolute top-0 right-0 h-full w-72 max-w-[80%] bg-zinc-950/95 backdrop-blur-xl border-l border-white/10 z-30 flex flex-col">
-                <div className="flex items-center justify-between px-3 py-2.5 border-b border-white/10 shrink-0">
-                  <span className="text-xs font-bold text-red-400 flex items-center gap-1.5">
-                    <MessageSquare className="w-4 h-4" /> چت
-                  </span>
-                  <button onClick={() => setChatOpen(false)} className="p-1 text-gray-400 hover:text-red-400 rounded-md">
-                    <X className="w-4 h-4" />
-                  </button>
-                </div>
-                <div
-                  ref={inPlayerChatScrollRef}
-                  className="flex-1 min-h-0 overflow-y-auto space-y-2 p-3 chat-scroll"
-                >
-                  {messages.length === 0 ? (
-                    <p className="text-center text-[10px] text-gray-500 py-8">هنوز پیامی نیست</p>
-                  ) : (
-                    messages.map((msg, idx) => (
-                      <div key={idx} className="glass-card p-2 rounded-xl border-l-2 border-l-red-500/40">
-                        <div className="flex items-center justify-between mb-0.5">
-                          <span className="font-bold text-red-400 text-[10px]">{msg.sender}</span>
-                          <span className="text-[9px] text-gray-500">{msg.time}</span>
-                        </div>
-                        <p className="text-gray-200 text-[11px] break-words">{msg.text}</p>
-                      </div>
-                    ))
-                  )}
-                </div>
-                <form
-                  onSubmit={(e) => { e.preventDefault(); sendChatMessage(); }}
-                  className="flex items-center gap-2 p-2.5 border-t border-white/10 shrink-0"
-                >
-                  <input
-                    type="text"
-                    value={chatInput}
-                    onChange={(e) => setChatInput(e.target.value)}
-                    placeholder="پیام..."
-                    className="input-field py-2 text-xs"
-                  />
-                  <button type="submit" className="btn-primary p-2 rounded-xl shrink-0">
-                    <Send className="w-4 h-4" />
-                  </button>
-                </form>
-              </div>
-            )}
 
             {/* Control request approval modal (rendered inside wrapper: visible in fullscreen) */}
             {requestModalOpen && pendingRequest && (
@@ -2001,13 +1991,21 @@ export const Room = ({ roomId, userName, isHost, onLeave }) => {
                   setMkvError('');
                   setMkvTracks([]);
                   try {
-                    const res = await fetch(url);
+                    // Try to fetch with CORS; if blocked, suggest alternatives
+                    const res = await fetch(url, { mode: 'cors' });
+                    if (!res.ok) throw new Error(`HTTP ${res.status}: ${res.statusText}`);
                     const buf = await res.arrayBuffer();
                     const tracks = await extractMkvSubtitles(buf);
                     setMkvTracks(tracks);
                     if (tracks.length === 0) setMkvError('زیرنویس داخلی در این ویدیو یافت نشد');
+                    else addToast(`${tracks.length} ترک زیرنویس یافت شد`, 'success');
                   } catch (e) {
-                    setMkvError('استخراج ناموفق بود: ' + (e?.message || e));
+                    const msg = e?.message || String(e);
+                    if (msg.includes('CORS') || msg.includes('cross-origin') || msg.includes('Failed to fetch')) {
+                      setMkvError('CORS blocked: سرور ویدیو اجازه خواندن مستقیم را نمی‌دهد. فایل را دانلود و آپلود کنید یا از لینک مستقیم SRT استفاده کنید.');
+                    } else {
+                      setMkvError('استخراج ناموفق بود: ' + msg);
+                    }
                   } finally {
                     setMkvLoading(false);
                   }
@@ -2087,6 +2085,276 @@ export const Room = ({ roomId, userName, isHost, onLeave }) => {
             )}
           </div>
         )}
+      </Modal>
+
+      {/* Subtitle Settings Modal */}
+      <Modal
+        isOpen={subtitleModalOpen}
+        onClose={() => setSubtitleModalOpen(false)}
+        title="تنظیمات زیرنویس"
+      >
+        <div className="space-y-5">
+          {/* Enable/Disable toggle */}
+          <div className="flex items-center justify-between p-3 glass-card rounded-xl">
+            <div className="flex items-center gap-3">
+              <div className="w-10 h-10 rounded-xl bg-red-600/20 border border-red-500/30 flex items-center justify-center">
+                <Subtitles className="w-5 h-5 text-red-400" />
+              </div>
+              <div>
+                <h4 className="font-bold text-white">زیرنویس</h4>
+                <p className="text-[10px] text-gray-400">فعال/غیرفعال کردن نمایش زیرنویس</p>
+              </div>
+            </div>
+            <button
+              onClick={() => setSubtitleEnabled((s) => !s)}
+              className={`relative w-12 h-7 rounded-full transition-all ${
+                subtitleEnabled ? 'bg-red-500' : 'bg-gray-600'
+              }`}
+              role="switch"
+              aria-checked={subtitleEnabled}
+            >
+              <span
+                className={`absolute top-0.5 bottom-0.5 w-6 rounded-full bg-white transition-transform shadow-lg ${
+                  subtitleEnabled ? 'translate-x-5' : 'translate-x-0.5'
+                }`}
+              />
+            </button>
+          </div>
+
+          <div className="border-t border-white/5 pt-2 space-y-4">
+            {/* Font Size */}
+            <div className="glass-card p-4 rounded-xl">
+              <div className="flex items-center justify-between mb-3">
+                <div className="flex items-center gap-2">
+                  <Type className="w-5 h-5 text-red-400" />
+                  <span className="font-medium text-white">اندازه فونت</span>
+                </div>
+                <span className="text-sm font-mono text-red-400 bg-red-500/10 px-2 py-0.5 rounded">
+                  {subtitleSettings.fontSize}px
+                </span>
+              </div>
+              <div className="flex items-center gap-3">
+                <button
+                  onClick={() => setSubtitleSettings((s) => ({ ...s, fontSize: Math.max(12, s.fontSize - 2) }))}
+                  className="p-2 rounded-lg bg-red-500/20 hover:bg-red-500/30 text-red-400 transition-colors"
+                  aria-label="کاهش اندازه فونت"
+                >
+                  <Minus className="w-5 h-5" />
+                </button>
+                <input
+                  type="range"
+                  min="12"
+                  max="48"
+                  step="2"
+                  value={subtitleSettings.fontSize}
+                  onChange={(e) => setSubtitleSettings((s) => ({ ...s, fontSize: Number(e.target.value) }))}
+                  className="flex-1 neon-range"
+                />
+                <button
+                  onClick={() => setSubtitleSettings((s) => ({ ...s, fontSize: Math.min(48, s.fontSize + 2) }))}
+                  className="p-2 rounded-lg bg-red-500/20 hover:bg-red-500/30 text-red-400 transition-colors"
+                  aria-label="افزایش اندازه فونت"
+                >
+                  <Plus className="w-5 h-5" />
+                </button>
+              </div>
+            </div>
+
+            {/* Font Color */}
+            <div className="glass-card p-4 rounded-xl">
+              <div className="flex items-center justify-between mb-3">
+                <div className="flex items-center gap-2">
+                  <Palette className="w-5 h-5 text-red-400" />
+                  <span className="font-medium text-white">رنگ فونت</span>
+                </div>
+                <input
+                  type="color"
+                  value={subtitleSettings.fontColor}
+                  onChange={(e) => setSubtitleSettings((s) => ({ ...s, fontColor: e.target.value }))}
+                  className="w-10 h-10 rounded-lg border border-white/10 cursor-pointer"
+                />
+              </div>
+              <div className="flex gap-2 flex-wrap">
+                {['#ffffff', '#ffeb3b', '#00e676', '#ff1744', '#2979ff', '#ff9100'].map((color) => (
+                  <button
+                    key={color}
+                    onClick={() => setSubtitleSettings((s) => ({ ...s, fontColor: color }))}
+                    className={`w-8 h-8 rounded-lg border-2 transition-all ${
+                      subtitleSettings.fontColor === color ? 'border-red-400 scale-110' : 'border-white/10 hover:border-red-500/50'
+                    }`}
+                    style={{ backgroundColor: color }}
+                    aria-label={`رنگ ${color}`}
+                  />
+                ))}
+              </div>
+            </div>
+
+            {/* Background Color */}
+            <div className="glass-card p-4 rounded-xl">
+              <div className="flex items-center justify-between mb-3">
+                <div className="flex items-center gap-2">
+                  <div className="w-5 h-5 rounded bg-gradient-to-r from-red-500 to-orange-500" />
+                  <span className="font-medium text-white">پس‌زمینه</span>
+                </div>
+                <input
+                  type="color"
+                  value={subtitleSettings.backgroundColor}
+                  onChange={(e) => setSubtitleSettings((s) => ({ ...s, backgroundColor: e.target.value }))}
+                  className="w-10 h-10 rounded-lg border border-white/10 cursor-pointer"
+                />
+              </div>
+              <div className="flex gap-2 flex-wrap">
+                {['rgba(0,0,0,0.7)', 'rgba(0,0,0,0.5)', 'rgba(20,20,30,0.8)', 'rgba(139,0,0,0.6)', 'transparent'].map((bg, i) => (
+                  <button
+                    key={i}
+                    onClick={() => setSubtitleSettings((s) => ({ ...s, backgroundColor: bg }))}
+                    className={`w-20 h-10 rounded-lg border-2 flex items-center justify-center text-[10px] font-mono transition-all ${
+                      subtitleSettings.backgroundColor === bg ? 'border-red-400 scale-110' : 'border-white/10 hover:border-red-500/50'
+                    }`}
+                    style={{ backgroundColor: bg }}
+                  >
+                    {bg === 'transparent' ? 'بدون' : 'سایه'}
+                  </button>
+                ))}
+              </div>
+            </div>
+
+            {/* Background Blur */}
+            <div className="glass-card p-4 rounded-xl">
+              <div className="flex items-center justify-between mb-3">
+                <div className="flex items-center gap-2">
+                  <SlidersHorizontal className="w-5 h-5 text-red-400" />
+                  <span className="font-medium text-white">بلور پس‌زمینه</span>
+                </div>
+                <span className="text-sm font-mono text-red-400 bg-red-500/10 px-2 py-0.5 rounded">
+                  {subtitleSettings.backgroundBlur}px
+                </span>
+              </div>
+              <input
+                type="range"
+                min="0"
+                max="20"
+                step="1"
+                value={subtitleSettings.backgroundBlur}
+                onChange={(e) => setSubtitleSettings((s) => ({ ...s, backgroundBlur: Number(e.target.value) }))}
+                className="neon-range"
+              />
+            </div>
+
+            {/* Vertical Position */}
+            <div className="glass-card p-4 rounded-xl">
+              <div className="flex items-center justify-between mb-3">
+                <div className="flex items-center gap-2">
+                  <div className="w-5 h-5 rounded border-2 border-red-400 relative">
+                    <div className="absolute bottom-0 left-1/2 -translate-x-1/2 w-1.5 h-1.5 bg-red-400 rounded-full" />
+                  </div>
+                  <span className="font-medium text-white">موقعیت عمودی</span>
+                </div>
+                <span className="text-sm font-mono text-red-400 bg-red-500/10 px-2 py-0.5 rounded">
+                  {subtitleSettings.verticalOffset}px از پایین
+                </span>
+              </div>
+              <input
+                type="range"
+                min="8"
+                max="200"
+                step="4"
+                value={subtitleSettings.verticalOffset}
+                onChange={(e) => setSubtitleSettings((s) => ({ ...s, verticalOffset: Number(e.target.value) }))}
+                className="neon-range"
+              />
+              <div className="flex justify-between text-[10px] text-gray-500 mt-1">
+                <span>بالا (8px)</span>
+                <span>پایین (200px)</span>
+              </div>
+            </div>
+
+            {/* Text Shadow Toggle */}
+            <div className="flex items-center justify-between p-3 glass-card rounded-xl">
+              <div className="flex items-center gap-3">
+                <div className="w-10 h-10 rounded-xl bg-purple-600/20 border border-purple-500/30 flex items-center justify-center">
+                  <Type className="w-5 h-5 text-purple-400" />
+                </div>
+                <div>
+                  <h4 className="font-bold text-white">سایه متن</h4>
+                  <p className="text-[10px] text-gray-400">افزودن سایه برای خوانایی بهتر</p>
+                </div>
+              </div>
+              <button
+                onClick={() => setSubtitleSettings((s) => ({ ...s, textShadow: !s.textShadow }))}
+                className={`relative w-12 h-7 rounded-full transition-all ${
+                  subtitleSettings.textShadow ? 'bg-purple-500' : 'bg-gray-600'
+                }`}
+                role="switch"
+                aria-checked={subtitleSettings.textShadow}
+              >
+                <span
+                  className={`absolute top-0.5 bottom-0.5 w-6 rounded-full bg-white transition-transform shadow-lg ${
+                    subtitleSettings.textShadow ? 'translate-x-5' : 'translate-x-0.5'
+                  }`}
+                />
+              </button>
+            </div>
+
+            {/* Reset Button */}
+            <button
+              onClick={() => setSubtitleSettings({
+                fontSize: 20,
+                fontColor: '#ffffff',
+                backgroundColor: 'rgba(0, 0, 0, 0.7)',
+                backgroundBlur: 4,
+                verticalOffset: 24,
+                fontFamily: 'inherit',
+                textShadow: true,
+              })}
+              className="w-full btn-secondary text-sm gap-2"
+            >
+              <SlidersHorizontal className="w-4 h-4" />
+              بازنشانی به پیش‌فرض
+            </button>
+          </div>
+        </div>
+      </Modal>
+
+      {/* Chat Modal */}
+      <Modal
+        isOpen={chatModalOpen}
+        onClose={() => setChatModalOpen(false)}
+        title="چت اتاق"
+      >
+        <div className="space-y-4">
+          <div
+            ref={chatModalScrollRef}
+            className="flex-1 min-h-0 max-h-[60vh] overflow-y-auto space-y-2 p-1 chat-scroll"
+          >
+            {messages.length === 0 ? (
+              <p className="text-center text-[10px] text-gray-500 py-8">هنوز پیامی ارسال نشده است</p>
+            ) : (
+              messages.map((msg, idx) => (
+                <div key={idx} className="glass-card p-3 rounded-xl border-l-2 border-l-red-500/40 animate-fade-in">
+                  <div className="flex items-center justify-between mb-1">
+                    <span className="font-bold text-red-400 text-xs">{msg.sender}</span>
+                    <span className="text-[9px] text-gray-500">{msg.time}</span>
+                  </div>
+                  <p className="text-gray-200 text-sm break-words">{msg.text}</p>
+                </div>
+              ))
+            )}
+          </div>
+          <form onSubmit={sendChatMessage} className="flex items-center gap-2 shrink-0">
+            <input
+              type="text"
+              value={chatInput}
+              onChange={(e) => setChatInput(e.target.value)}
+              placeholder="پیام خود را بنویسید..."
+              className="input-field py-2 text-sm flex-1"
+              autoFocus
+            />
+            <button type="submit" className="btn-primary p-2.5 rounded-xl shrink-0">
+              <Send className="w-5 h-5" />
+            </button>
+          </form>
+        </div>
       </Modal>
 
     </div>
