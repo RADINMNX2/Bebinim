@@ -1,13 +1,14 @@
-import React, { useState, useEffect, useRef, useLayoutEffect } from 'react';
+import React, { useState, useEffect, useRef, useLayoutEffect, useCallback } from 'react';
 import Peer from 'peerjs';
 import {
   Play, Pause, Volume2, VolumeX, Maximize, Minimize, Share2, Users, MessageSquare,
   Send, Link as LinkIcon, Film, LogOut, Check, Radio, Wifi, RefreshCw,
   Crown, Shield, ShieldOff, UserX, Settings, Loader2, Rewind, FastForward,
-  Subtitles, Download, PictureInPicture, Languages, Trash2, X
+  Subtitles, PictureInPicture, Languages, X
 } from 'lucide-react';
 import { useToast } from '../../context/ToastContext';
 import { Modal } from '../UI/Modal';
+import { extractMkvSubtitles } from '../../utils/mkvSubtitles';
 
 // Default free STUN servers to maximize NAT traversal success inside Iran
 const DEFAULT_STUN_SERVERS = [
@@ -151,6 +152,7 @@ export const Room = ({ roomId, userName, isHost, onLeave }) => {
   const [messages, setMessages] = useState([]);
   const [chatWindow, setChatWindow] = useState(CHAT_WINDOW);
   const [chatInput, setChatInput] = useState('');
+  const [unreadChat, setUnreadChat] = useState(0);
 
   // Video state
   const [videoUrl, setVideoUrl] = useState('');
@@ -175,12 +177,17 @@ export const Room = ({ roomId, userName, isHost, onLeave }) => {
   const [subUrlInput, setSubUrlInput] = useState('');
   const subtitleFileRef = useRef(null);
   const subtitleSourceRef = useRef('');
+  const [mkvTracks, setMkvTracks] = useState([]);
+  const [mkvLoading, setMkvLoading] = useState(false);
+  const [mkvError, setMkvError] = useState('');
 
   // Controls direction (RTL / LTR)
   const [controlsDir, setControlsDir] = useState('rtl');
 
-  // Download manager
-  const [downloads, setDownloads] = useState([]);
+  // Auto-hide controls + in-player chat (fullscreen)
+  const [controlsVisible, setControlsVisible] = useState(true);
+  const [buffered, setBuffered] = useState(0);
+  const [chatOpen, setChatOpen] = useState(false);
 
   // Role / management state
   const [selfIsAdmin, setSelfIsAdmin] = useState(false);
@@ -192,7 +199,7 @@ export const Room = ({ roomId, userName, isHost, onLeave }) => {
   const [requestModalOpen, setRequestModalOpen] = useState(false);
 
   // UI states
-  const [activeTab, setActiveTab] = useState('chat'); // 'chat' | 'users' | 'downloads'
+  const [activeTab, setActiveTab] = useState('chat'); // 'chat' | 'users'
   const [isUrlModalOpen, setIsUrlModalOpen] = useState(false);
   const [isShareModalOpen, setIsShareModalOpen] = useState(false);
   const [reactions, setReactions] = useState([]);
@@ -212,12 +219,18 @@ export const Room = ({ roomId, userName, isHost, onLeave }) => {
   const chatScrollRef = useRef(null);
   const chatAtBottomRef = useRef(true);
   const pendingChatShiftRef = useRef(null);
-  const downloadCtrlsRef = useRef({});
   const activeSubtitleRef = useRef('');
   const userSpeedRef = useRef(1);
   const sendingReqRef = useRef(false);
   const lastRequestRef = useRef(null);
   const lastDriftReportRef = useRef(0);
+  const hideTimerRef = useRef(null);
+  const pendingPlayRef = useRef(null);
+  const inPlayerChatScrollRef = useRef(null);
+  const isFullscreenRef = useRef(false);
+  isFullscreenRef.current = isFullscreen;
+  const chatOpenRef = useRef(false);
+  chatOpenRef.current = chatOpen;
 
   // Sync internals (upgraded engine)
   const clockOffsetRef = useRef(0);
@@ -250,6 +263,18 @@ export const Room = ({ roomId, userName, isHost, onLeave }) => {
   const { addToast } = useToast();
 
   useEffect(() => { videoUrlRef.current = videoUrl; }, [videoUrl]);
+
+  // --- Auto-hide controls after inactivity (kept visible while paused) ---
+  const showControls = useCallback(() => {
+    setControlsVisible(true);
+    clearTimeout(hideTimerRef.current);
+    hideTimerRef.current = setTimeout(() => {
+      if (!videoRef.current?.paused && !chatOpenRef.current) {
+        setControlsVisible(false);
+      }
+    }, 3000);
+  }, []);
+  useEffect(() => () => clearTimeout(hideTimerRef.current), []);
 
   // Broadcast to all connected peers (uses ref so closures never go stale)
   const broadcast = (data, excludePeerId = null) => {
@@ -310,8 +335,8 @@ export const Room = ({ roomId, userName, isHost, onLeave }) => {
       if (Date.now() >= deadline) {
         clearInterval(bufferTimerRef.current);
         setIsBuffering(false);
+        const v = videoRef.current;
         if (isHostRef.current) {
-          const v = videoRef.current;
           if (v && v.readyState >= 2 && v.paused) {
             v.play().catch(() => {});
             setIsPlaying(true);
@@ -319,6 +344,13 @@ export const Room = ({ roomId, userName, isHost, onLeave }) => {
           } else {
             pendingAutoPlayRef.current = true;
           }
+        } else if (v && v.readyState >= 2 && pendingPlayRef.current) {
+          // Late-join guest: only start playback after we've actually buffered
+          safePlay(v).then(() => {
+            setIsPlaying(true);
+            broadcastRef.current({ type: 'PLAY_ACK', t: Date.now() });
+          });
+          pendingPlayRef.current = false;
         }
       }
     }, 500);
@@ -356,6 +388,7 @@ export const Room = ({ roomId, userName, isHost, onLeave }) => {
 
     if (data.url && data.url !== videoUrlRef.current) {
       pendingSeekRef.current = Math.max(0, estTime);
+      pendingPlayRef.current = !!data.playing;
       videoUrlRef.current = data.url;
       setVideoUrl(data.url);
       startBuffering(data.readyAt || now + BUFFER_SECONDS * 1000);
@@ -547,6 +580,13 @@ export const Room = ({ roomId, userName, isHost, onLeave }) => {
 
       case 'CHAT_MESSAGE':
         setMessages((prev) => [...prev, { sender: data.sender, text: data.text, time: data.time }]);
+        // Auto-open the in-player chat panel in fullscreen, else bump the unread badge
+        if (isFullscreenRef.current) {
+          setChatOpen(true);
+          setUnreadChat(0);
+        } else if (!chatOpenRef.current) {
+          setUnreadChat((n) => n + 1);
+        }
         break;
 
       case 'REACTION':
@@ -909,6 +949,33 @@ export const Room = ({ roomId, userName, isHost, onLeave }) => {
     return () => document.removeEventListener('fullscreenchange', onChange);
   }, []);
 
+  // Activity listeners keep controls visible; reactions (z-20) stay above and don't block
+  useEffect(() => {
+    const el = playerWrapRef.current;
+    if (!el) return;
+    const onMove = () => showControls();
+    el.addEventListener('pointermove', onMove);
+    el.addEventListener('pointerdown', onMove);
+    el.addEventListener('touchstart', onMove, { passive: true });
+    return () => {
+      el.removeEventListener('pointermove', onMove);
+      el.removeEventListener('pointerdown', onMove);
+      el.removeEventListener('touchstart', onMove);
+    };
+  }, [showControls]);
+
+  // Clear the unread badge whenever the in-player chat is opened
+  useEffect(() => {
+    if (chatOpen) setUnreadChat(0);
+  }, [chatOpen]);
+
+  // Keep the in-player chat scrolled to the latest message
+  useEffect(() => {
+    if (chatOpen && inPlayerChatScrollRef.current) {
+      inPlayerChatScrollRef.current.scrollTop = inPlayerChatScrollRef.current.scrollHeight;
+    }
+  }, [messages, chatOpen]);
+
   const enterFullscreen = () => {
     if (!playerWrapRef.current) return;
     if (document.fullscreenElement) {
@@ -931,6 +998,18 @@ export const Room = ({ roomId, userName, isHost, onLeave }) => {
   const loadSubtitleText = (text, name) => {
     const cues = parseSubtitles(text);
     subtitleSourceRef.current = text;
+    setSubtitleCues(cues);
+    setSubtitleName(name);
+    setSubtitleEnabled(cues.length > 0);
+    setSubtitleText('');
+    addToast(
+      cues.length > 0 ? `زیرنویس «${name}» با ${cues.length} بخش بارگذاری شد` : 'زیرنویس معتبری یافت نشد',
+      cues.length > 0 ? 'success' : 'error'
+    );
+  };
+
+  // Load raw parsed cues (e.g. extracted from an MKV) directly
+  const loadSubtitleCues = (cues, name) => {
     setSubtitleCues(cues);
     setSubtitleName(name);
     setSubtitleEnabled(cues.length > 0);
@@ -1073,7 +1152,7 @@ export const Room = ({ roomId, userName, isHost, onLeave }) => {
     setTimeout(() => setIsCopied(false), 2000);
   };
 
-  // --- Download manager engine ---
+  // --- Subtitle download (export current subtitle text) ---
   const downloadSubtitle = () => {
     if (subtitleCues.length === 0) return;
     const name = subtitleName || 'subtitle.srt';
@@ -1085,64 +1164,6 @@ export const Room = ({ roomId, userName, isHost, onLeave }) => {
     a.click();
     setTimeout(() => URL.revokeObjectURL(objUrl), 10000);
     addToast(`زیرنویس «${name}» دانلود شد`, 'success');
-  };
-
-  const downloadVideo = async (url) => {
-    if (!url) return;
-    const name = url.split('/').pop().split('?')[0] || 'video.mp4';
-    const id = `${Date.now()}-${Math.random().toString(36).slice(2, 6)}`;
-    const ctrl = new AbortController();
-    downloadCtrlsRef.current[id] = ctrl;
-    setDownloads((prev) => [{ id, name, progress: 0, status: 'downloading' }, ...prev]);
-    addToast(`دانلود «${name}» شروع شد`, 'info');
-    try {
-      const res = await fetch(url, { signal: ctrl.signal });
-      if (!res.ok) throw new Error(`HTTP ${res.status}`);
-      const total = +res.headers.get('content-length') || 0;
-      const reader = res.body.getReader();
-      const chunks = [];
-      let received = 0;
-      for (;;) {
-        const { done, value } = await reader.read();
-        if (done) break;
-        chunks.push(value);
-        received += value.length;
-        if (total > 0) {
-          const pct = Math.round((received / total) * 100);
-          setDownloads((prev) => prev.map((d) => (d.id === id ? { ...d, progress: pct } : d)));
-        }
-      }
-      const blob = new Blob(chunks);
-      const objUrl = URL.createObjectURL(blob);
-      const a = document.createElement('a');
-      a.href = objUrl;
-      a.download = name;
-      a.click();
-      setTimeout(() => URL.revokeObjectURL(objUrl), 10000);
-      setDownloads((prev) => prev.map((d) => (d.id === id ? { ...d, status: 'done', progress: 100, size: blob.size } : d)));
-      addToast(`دانلود «${name}» کامل شد`, 'success');
-    } catch (err) {
-      if (err.name === 'AbortError') {
-        setDownloads((prev) => prev.map((d) => (d.id === id ? { ...d, status: 'cancelled' } : d)));
-        return;
-      }
-      // CORS/network blocked -> open the link so the browser handles it
-      try {
-        window.open(url, '_blank');
-        setDownloads((prev) => prev.map((d) => (d.id === id ? { ...d, status: 'done', note: 'لینک باز شد (CORS مانع نمایش پیشرفت)' } : d)));
-        addToast('دانلود مستقیم ممکن نبود؛ لینک ویدیو باز شد', 'info');
-      } catch {
-        setDownloads((prev) => prev.map((d) => (d.id === id ? { ...d, status: 'error' } : d)));
-      }
-    }
-  };
-
-  const cancelDownload = (id) => {
-    downloadCtrlsRef.current[id]?.abort();
-  };
-
-  const removeDownload = (id) => {
-    setDownloads((prev) => prev.filter((d) => d.id !== id));
   };
 
   // --- Keyboard shortcuts ---
@@ -1175,10 +1196,6 @@ export const Room = ({ roomId, userName, isHost, onLeave }) => {
         case 'c':
         case 'C':
           setSubtitleEnabled((s) => !s);
-          break;
-        case 'd':
-        case 'D':
-          if (videoUrlRef.current) downloadVideo(videoUrlRef.current);
           break;
         default:
           break;
@@ -1322,8 +1339,15 @@ export const Room = ({ roomId, userName, isHost, onLeave }) => {
                 ref={videoRef}
                 src={videoUrl}
                 playsInline
+                preload="auto"
                 className="w-full h-full object-contain cursor-pointer"
                 onTimeUpdate={handleTimeUpdate}
+                onProgress={() => {
+                  const v = videoRef.current;
+                  if (v && v.buffered.length > 0) {
+                    setBuffered(v.buffered.end(v.buffered.length - 1));
+                  }
+                }}
                 onLoadStart={() => setCodecError(false)}
                 onLoadedMetadata={() => {
                   if (videoRef.current) {
@@ -1347,6 +1371,11 @@ export const Room = ({ roomId, userName, isHost, onLeave }) => {
                     pendingAutoPlayRef.current = false;
                     safePlay(v).then(() => setIsPlaying(true));
                     broadcastRef.current({ type: 'PLAY', currentTime: v.currentTime, sentAt: Date.now() });
+                  } else if (!isHostRef.current && pendingPlayRef.current && v.readyState >= 2) {
+                    // Late-join guest: start only after the element can play
+                    pendingPlayRef.current = false;
+                    safePlay(v).then(() => setIsPlaying(true));
+                    broadcastRef.current({ type: 'PLAY_ACK', t: Date.now() });
                   }
                 }}
                 onPlay={() => setIsPlaying(true)}
@@ -1366,11 +1395,11 @@ export const Room = ({ roomId, userName, isHost, onLeave }) => {
                   MP4 (H.264) و WebM (VP9/AV1) بهترین سازگاری را دارند؛ MKV در صورت داشتن کدک پشتیبانی‌شده پخش می‌شود.
                 </p>
                 <button
-                  onClick={() => downloadVideo(videoUrlRef.current)}
+                  onClick={() => setCodecError(false)}
                   className="btn-primary text-xs md:text-sm"
                 >
-                  <Download className="w-4 h-4" />
-                  دانلود ویدیو
+                  <Film className="w-4 h-4" />
+                  بستن
                 </button>
               </div>
             )}
@@ -1397,7 +1426,7 @@ export const Room = ({ roomId, userName, isHost, onLeave }) => {
             )}
 
             {/* Video Overlay Controls (interactive children re-enable clicks) */}
-            <div className={`absolute inset-0 bg-gradient-to-t from-black/90 via-transparent to-black/40 opacity-0 group-hover:opacity-100 transition-opacity duration-300 flex flex-col justify-between p-3 md:p-6 z-10 overlay-coarse pointer-events-none`}>
+            <div className={`absolute inset-0 bg-gradient-to-t from-black/90 via-transparent to-black/40 ${controlsVisible ? 'opacity-100 pointer-events-auto' : 'opacity-0 pointer-events-none'} transition-opacity duration-300 flex flex-col justify-between p-3 md:p-6 z-10`}>
 
               {/* Top Video bar */}
               <div className="flex items-center justify-between gap-2 pointer-events-auto">
@@ -1431,6 +1460,17 @@ export const Room = ({ roomId, userName, isHost, onLeave }) => {
                       <span className="hidden md:inline">تغییر ویدیو</span>
                     </button>
                   )}
+                  <button
+                    onClick={() => setChatOpen((o) => !o)}
+                    className={`py-1.5 px-3 text-xs gap-1.5 rounded-xl border transition-colors ${chatOpen ? 'bg-red-600/30 border-red-500/50 text-red-300' : 'bg-black/40 border-white/10 text-gray-300'}`}
+                    title="چت"
+                  >
+                    <MessageSquare className="w-3.5 h-3.5" />
+                    <span className="hidden md:inline">چت</span>
+                    {unreadChat > 0 && (
+                      <span className="px-1.5 py-0.5 text-[9px] bg-red-600 rounded-full">{unreadChat}</span>
+                    )}
+                  </button>
                 </div>
               </div>
 
@@ -1446,18 +1486,21 @@ export const Room = ({ roomId, userName, isHost, onLeave }) => {
               </div>
 
               {/* Bottom Video Controls Bar */}
-              <div className="flex flex-col gap-2.5 md:gap-3 pointer-events-auto" dir={controlsDir}>
-                {/* Progress bar */}
-                <input
-                  type="range"
-                  min={0}
-                  max={duration || 100}
-                  value={currentTime}
-                  onChange={handleSeek}
-                  onPointerUp={handleSeekRelease}
-                  disabled={isBuffering}
-                  className="neon-range w-full"
-                />
+                <div className="flex flex-col gap-2.5 md:gap-3 pointer-events-auto" dir={controlsDir}>
+                  {/* Progress bar with buffered indicator */}
+                  <div className="relative w-full">
+                    <div className="absolute top-1/2 -translate-y-1/2 left-0 h-1 rounded-full bg-white/15 pointer-events-none" style={{ width: `${duration ? Math.min(100, (buffered / duration) * 100) : 0}%` }}></div>
+                    <input
+                      type="range"
+                      min={0}
+                      max={duration || 100}
+                      value={currentTime}
+                      onChange={handleSeek}
+                      onPointerUp={handleSeekRelease}
+                      disabled={isBuffering}
+                      className="neon-range w-full"
+                    />
+                  </div>
 
                 <div className="flex items-center justify-between gap-2 text-[10px] md:text-xs text-gray-300 flex-wrap">
                   {/* Transport controls: RTL/LTR aware */}
@@ -1594,6 +1637,53 @@ export const Room = ({ roomId, userName, isHost, onLeave }) => {
               </div>
             </div>
 
+            {/* In-player Chat panel (fullscreen side panel, outside the overlay so it doesn't auto-hide) */}
+            {chatOpen && (
+              <div className="absolute top-0 right-0 h-full w-72 max-w-[80%] bg-zinc-950/95 backdrop-blur-xl border-l border-white/10 z-30 flex flex-col">
+                <div className="flex items-center justify-between px-3 py-2.5 border-b border-white/10 shrink-0">
+                  <span className="text-xs font-bold text-red-400 flex items-center gap-1.5">
+                    <MessageSquare className="w-4 h-4" /> چت
+                  </span>
+                  <button onClick={() => setChatOpen(false)} className="p-1 text-gray-400 hover:text-red-400 rounded-md">
+                    <X className="w-4 h-4" />
+                  </button>
+                </div>
+                <div
+                  ref={inPlayerChatScrollRef}
+                  className="flex-1 min-h-0 overflow-y-auto space-y-2 p-3 chat-scroll"
+                >
+                  {messages.length === 0 ? (
+                    <p className="text-center text-[10px] text-gray-500 py-8">هنوز پیامی نیست</p>
+                  ) : (
+                    messages.map((msg, idx) => (
+                      <div key={idx} className="glass-card p-2 rounded-xl border-l-2 border-l-red-500/40">
+                        <div className="flex items-center justify-between mb-0.5">
+                          <span className="font-bold text-red-400 text-[10px]">{msg.sender}</span>
+                          <span className="text-[9px] text-gray-500">{msg.time}</span>
+                        </div>
+                        <p className="text-gray-200 text-[11px] break-words">{msg.text}</p>
+                      </div>
+                    ))
+                  )}
+                </div>
+                <form
+                  onSubmit={(e) => { e.preventDefault(); sendChatMessage(); }}
+                  className="flex items-center gap-2 p-2.5 border-t border-white/10 shrink-0"
+                >
+                  <input
+                    type="text"
+                    value={chatInput}
+                    onChange={(e) => setChatInput(e.target.value)}
+                    placeholder="پیام..."
+                    className="input-field py-2 text-xs"
+                  />
+                  <button type="submit" className="btn-primary p-2 rounded-xl shrink-0">
+                    <Send className="w-4 h-4" />
+                  </button>
+                </form>
+              </div>
+            )}
+
             {/* Control request approval modal (rendered inside wrapper: visible in fullscreen) */}
             {requestModalOpen && pendingRequest && (
               <div className="absolute inset-0 z-40 flex items-center justify-center p-4 bg-black/60 backdrop-blur-sm">
@@ -1667,7 +1757,7 @@ export const Room = ({ roomId, userName, isHost, onLeave }) => {
         <div className="lg:col-span-1 bg-zinc-950/80 backdrop-blur-xl rounded-2xl md:rounded-3xl flex flex-col h-[42dvh] lg:h-auto lg:min-h-0 border border-white/10 overflow-hidden shrink-0">
 
           {/* Sidebar Tabs Header */}
-          <div className="grid grid-cols-3 border-b border-white/5 bg-black/40 shrink-0">
+          <div className="grid grid-cols-2 border-b border-white/5 bg-black/40 shrink-0">
             <button
               onClick={() => setActiveTab('chat')}
               className={`py-2.5 md:py-3 text-xs md:text-sm font-bold transition-colors flex items-center justify-center gap-1.5 ${
@@ -1685,15 +1775,6 @@ export const Room = ({ roomId, userName, isHost, onLeave }) => {
             >
               <Users className="w-3.5 h-3.5 md:w-4 md:h-4" />
               <span>اعضا ({participants.length})</span>
-            </button>
-            <button
-              onClick={() => setActiveTab('downloads')}
-              className={`py-2.5 md:py-3 text-xs md:text-sm font-bold transition-colors flex items-center justify-center gap-1.5 ${
-                activeTab === 'downloads' ? 'text-red-400 border-b-2 border-red-500 bg-red-500/10 shadow-[0_0_20px_rgba(239,68,68,0.15)]' : 'text-gray-400 hover:text-white'
-              }`}
-            >
-              <Download className="w-3.5 h-3.5 md:w-4 md:h-4" />
-              <span>دانلود</span>
             </button>
           </div>
 
@@ -1788,66 +1869,6 @@ export const Room = ({ roomId, userName, isHost, onLeave }) => {
                   برای مدیریت هر کاربر روی کارت او کلیک کنید
                 </p>
               )}
-            </div>
-          )}
-
-          {/* Tab Content: Downloads (manager) */}
-          {activeTab === 'downloads' && (
-            <div className="flex-1 min-h-0 p-2.5 md:p-4 overflow-y-auto space-y-2.5 chat-scroll">
-              <button
-                onClick={() => downloadVideo(videoUrlRef.current)}
-                disabled={!videoUrl}
-                className="btn-primary w-full py-2.5 text-xs gap-1.5 disabled:opacity-40"
-              >
-                <Download className="w-4 h-4" />
-                دانلود ویدیوی فعلی
-              </button>
-              <button
-                onClick={() => subtitleCues.length > 0 && downloadSubtitle()}
-                disabled={subtitleCues.length === 0}
-                className="btn-secondary w-full py-2.5 text-xs gap-1.5 disabled:opacity-40"
-              >
-                <Subtitles className="w-4 h-4 text-red-400" />
-                دانلود زیرنویس ({subtitleName || 'خاموش'})
-              </button>
-
-              <div className="pt-2 border-t border-white/10 space-y-2">
-                {downloads.length === 0 ? (
-                  <p className="text-center text-[10px] text-gray-600 py-4">
-                    هنوز دانلودی انجام نشده است
-                  </p>
-                ) : (
-                  downloads.map((d) => (
-                    <div key={d.id} className="glass-card p-2.5 rounded-xl">
-                      <div className="flex items-center justify-between gap-2 mb-1.5">
-                        <span className="text-[10px] text-gray-300 truncate font-mono" dir="ltr">{d.name}</span>
-                        <div className="flex items-center gap-1 shrink-0">
-                          {d.status === 'downloading' && (
-                            <button onClick={() => cancelDownload(d.id)} className="p-1 text-red-400 hover:bg-red-500/10 rounded-md" title="لغو">
-                              <X className="w-3.5 h-3.5" />
-                            </button>
-                          )}
-                          <button onClick={() => removeDownload(d.id)} className="p-1 text-gray-500 hover:text-red-400 hover:bg-red-500/10 rounded-md" title="حذف از لیست">
-                            <Trash2 className="w-3.5 h-3.5" />
-                          </button>
-                        </div>
-                      </div>
-                      <div className="h-1.5 rounded-full bg-white/5 overflow-hidden">
-                        <div
-                          className={`h-full rounded-full transition-all ${d.status === 'done' ? 'bg-emerald-500' : d.status === 'error' || d.status === 'cancelled' ? 'bg-gray-600' : 'bg-gradient-to-r from-red-600 to-orange-500'}`}
-                          style={{ width: `${d.progress}%` }}
-                        ></div>
-                      </div>
-                      <div className="flex justify-between items-center mt-1">
-                        <span className={`text-[9px] ${d.status === 'done' ? 'text-emerald-400' : d.status === 'error' ? 'text-red-400' : d.status === 'cancelled' ? 'text-gray-500' : 'text-red-300'}`}>
-                          {d.status === 'downloading' ? `در حال دانلود... ${d.progress}%` : d.status === 'done' ? 'کامل شد' : d.status === 'cancelled' ? 'لغو شد' : 'خطا'}
-                        </span>
-                        {d.note && <span className="text-[8px] text-gray-500">{d.note}</span>}
-                      </div>
-                    </div>
-                  ))
-                )}
-              </div>
             </div>
           )}
 
@@ -1965,6 +1986,55 @@ export const Room = ({ roomId, userName, isHost, onLeave }) => {
                 <span className="text-[9px] text-emerald-400 truncate font-mono" dir="ltr">
                   ✓ {subtitleName}
                 </span>
+              )}
+            </div>
+
+            <div className="pt-1 space-y-2">
+              <button
+                onClick={async () => {
+                  const url = videoUrlRef.current;
+                  if (!url) {
+                    setMkvError('ابتدا یک ویدیو انتخاب کنید');
+                    return;
+                  }
+                  setMkvLoading(true);
+                  setMkvError('');
+                  setMkvTracks([]);
+                  try {
+                    const res = await fetch(url);
+                    const buf = await res.arrayBuffer();
+                    const tracks = await extractMkvSubtitles(buf);
+                    setMkvTracks(tracks);
+                    if (tracks.length === 0) setMkvError('زیرنویس داخلی در این ویدیو یافت نشد');
+                  } catch (e) {
+                    setMkvError('استخراج ناموفق بود: ' + (e?.message || e));
+                  } finally {
+                    setMkvLoading(false);
+                  }
+                }}
+                disabled={mkvLoading}
+                className="btn-secondary w-full text-xs gap-1.5 disabled:opacity-50"
+              >
+                {mkvLoading ? <Loader2 className="w-3.5 h-3.5 animate-spin" /> : <Film className="w-3.5 h-3.5 text-red-400" />}
+                استخراج زیرنویس داخلی (MKV)
+              </button>
+              {mkvError && <p className="text-[10px] text-red-400">{mkvError}</p>}
+              {mkvTracks.length > 0 && (
+                <div className="space-y-1.5">
+                  {mkvTracks.map((t) => (
+                    <div key={t.trackNumber} className="flex items-center justify-between gap-2 glass-card p-2 rounded-lg">
+                      <span className="text-[10px] text-gray-300 truncate" dir="ltr">
+                        #{t.trackNumber} · {t.type}{t.language ? ` · ${t.language}` : ''}{t.name ? ` · ${t.name}` : ''}
+                      </span>
+                      <button
+                        onClick={() => loadSubtitleCues(t.cues, `${t.language || 'sub'} (MKV #${t.trackNumber})`)}
+                        className="btn-primary py-1 px-2 text-[10px] shrink-0"
+                      >
+                        بارگذاری
+                      </button>
+                    </div>
+                  ))}
+                </div>
               )}
             </div>
           </div>

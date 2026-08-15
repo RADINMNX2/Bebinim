@@ -303,11 +303,8 @@ video {
   text-shadow: 0 2px 10px rgba(0, 0, 0, 0.95), 0 0 4px rgba(0, 0, 0, 0.9), 0 1px 2px rgba(0, 0, 0, 0.8);
 }
 
-/* TVs / touch devices have no hover: keep the video controls always visible */
+/* Touch devices: bigger range thumb for fat fingers (auto-hide handled in JS) */
 @media (pointer: coarse) {
-  .overlay-coarse {
-    opacity: 1 !important;
-  }
   input[type="range"].neon-range {
     height: 10px;
   }
