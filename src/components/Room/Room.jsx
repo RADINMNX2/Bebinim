@@ -1,9 +1,10 @@
 import React, { useState, useEffect, useRef, useLayoutEffect } from 'react';
 import Peer from 'peerjs';
 import {
-  Play, Pause, Volume2, VolumeX, Maximize, Share2, Users, MessageSquare,
+  Play, Pause, Volume2, VolumeX, Maximize, Minimize, Share2, Users, MessageSquare,
   Send, Link as LinkIcon, Film, LogOut, Check, Radio, Wifi, RefreshCw,
-  Crown, Shield, ShieldOff, UserX, Settings, Loader2
+  Crown, Shield, ShieldOff, UserX, Settings, Loader2, Rewind, FastForward,
+  Subtitles, Download, PictureInPicture, Languages, Trash2, X
 } from 'lucide-react';
 import { useToast } from '../../context/ToastContext';
 import { Modal } from '../UI/Modal';
@@ -20,16 +21,12 @@ const DEFAULT_STUN_SERVERS = [
 ];
 
 // --- Xirsys TURN (free tier) ---
-// Credentials are fetched at runtime via the Xirsys API so they can be rotated
-// from the Xirsys dashboard without rebuilding the app. Used only as a fallback
-// when direct P2P fails; if the TURN server is unreachable, WebRTC keeps working
-// over STUN/P2P (graceful degradation).
 const XIRSYS = {
   ident: 'RADINMNX',
   secret: '25a5cd9e-98ec-11f1-8480-cafcf9cf945e',
   channel: 'mnx-bebinim'
 };
-const XIRSYS_TTL_MS = 30 * 60 * 1000; // Refresh cached TURN creds every 30min
+const XIRSYS_TTL_MS = 30 * 60 * 1000;
 let xirsysCache = null;
 
 const fetchXirsysTurn = async () => {
@@ -53,11 +50,6 @@ const fetchXirsysTurn = async () => {
   }
 };
 
-// --- Connection config from the URL (no rebuild needed) ---
-// ?sig=ws://host:port        -> custom signaling server (PeerJS server, your PC or VPS)
-// ?turn=turn:host:port:user:pass -> add a TURN relay (Metered Open Relay, Xirsys, coturn...)
-// Both get embedded automatically into every invite link, so guests join the same network.
-// Without ?turn=, the built-in Xirsys free TURN is fetched automatically at runtime.
 const getUrlParams = () => new URLSearchParams(window.location.search);
 
 const buildPeerConfig = () => {
@@ -101,26 +93,57 @@ const ACTIVE_SIGNALING = getUrlParams().get('sig') || '0.peerjs.com';
 const ACTIVE_TURN = getUrlParams().get('turn') || null;
 
 // ==================== Sync tuning (world-class smooth sync) ====================
-// Strategy:
-//  1. Host is the media reference clock. It broadcasts full state every 2s
-//     with an ever-increasing sequence number (stale SYNCs are dropped).
-//  2. Guests measure the host clock offset with NTP-style PING/PONG (lowest
-//     RTT wins) and extrapolate the host position at the moment of receipt:
-//     est = sentTime + (now - sentAt + clockOffset).
-//  3. Small drift is corrected with a smooth playbackRate adjustment (no
-//     seeking, no visual jumps). Only drift >= HARD_DRIFT_THRESHOLD triggers
-//     a precise seek. Play/pause transitions always align exactly.
-//  4. Video changes force a 10s pre-buffer on EVERY client; play is gated on
-//     a shared absolute deadline (readyAt) so nobody starts ahead of others.
-const SYNC_INTERVAL_MS = 2000;        // Host broadcasts full state every 2s
-const PING_INTERVAL_MS = 15000;       // Guests re-measure host clock offset
-const HARD_DRIFT_THRESHOLD = 1.0;     // Drift >= 1s -> hard seek
-const RATE_CORRECTION_GAIN = 0.12;    // playbackRate = 1 + drift * gain
-const RATE_CORRECTION_LIMIT = 0.08;   // max smooth rate deviation (8%)
-const BUFFER_SECONDS = 10;            // Pre-buffer before a new video plays
-const MAX_CONNECT_RETRIES = 3;        // Guest retries to find the host
+// 1. Host is the media reference clock; it broadcasts full state every 2s
+//    (tightens to ~900ms while drift is being reported) with a monotonic
+//    sequence number so stale packets are dropped.
+// 2. Guests measure the host clock offset with NTP-style PING/PONG (EWMA
+//    smoothing, bad-RTT samples discarded) and extrapolate the host position
+//    at receipt: est = sentTime + (now - sentAt + clockOffset).
+// 3. Small drift is smoothed with a moving average and corrected via subtle
+//    playbackRate nudges (no seeking, no visual jumps). Only drift >=
+//    HARD_DRIFT_THRESHOLD triggers a precise seek. Play/pause always align.
+// 4. Video changes force a 10s pre-buffer on EVERY client, gated on a shared
+//    absolute deadline (readyAt). Playback waits for canplay (never stalls).
+const SYNC_INTERVAL_MS = 2000;
+const SYNC_FAST_INTERVAL_MS = 900;
+const PING_INTERVAL_MS = 15000;
+const HARD_DRIFT_THRESHOLD = 1.0;
+const RATE_CORRECTION_GAIN = 0.12;
+const RATE_CORRECTION_LIMIT = 0.08;
+const BUFFER_SECONDS = 10;
+const MAX_CONNECT_RETRIES = 3;
 const RETRY_DELAY_MS = 2500;
-const CHAT_WINDOW = 60;               // Lazy chat: render at most N messages
+const CHAT_WINDOW = 60;
+const SKIP_SECONDS = 10;
+const SPEEDS = [0.5, 0.75, 1, 1.25, 1.5, 2];
+
+const ACTION_LABELS = {
+  toggle: 'پخش / توقف',
+  seek: 'پرش به زمان',
+  fullscreen: 'تمام صفحه'
+};
+
+// --- SRT / WebVTT parser (modern subtitles: SRT + VTT) ---
+const parseSubtitles = (text) => {
+  const blocks = text.split(/\r?\n\r?\n/);
+  const cues = [];
+  const timeRe = /(\d{1,2}):(\d{2}):(\d{2})[,.](\d{1,3})\s*-->\s*(\d{1,2}):(\d{2}):(\d{2})[,.](\d{1,3})/;
+  for (const block of blocks) {
+    const m = block.match(timeRe);
+    if (!m) continue;
+    const frac = (v) => v.padEnd(3, '0');
+    const start = +m[1] * 3600 + +m[2] * 60 + +m[3] + +frac(m[4]) / 1000;
+    const end = +m[5] * 3600 + +m[6] * 60 + +m[7] + +frac(m[8]) / 1000;
+    const text = block.replace(timeRe, '').replace(/<[^>]+>/g, '').trim();
+    if (text) cues.push({ start, end, text });
+  }
+  return cues.sort((a, b) => a.start - b.start);
+};
+
+const fmtTime = (sec) => {
+  if (!isFinite(sec) || sec < 0) sec = 0;
+  return `${Math.floor(sec / 60)}:${Math.floor(sec % 60).toString().padStart(2, '0')}`;
+};
 
 export const Room = ({ roomId, userName, isHost, onLeave }) => {
   const [connections, setConnections] = useState([]);
@@ -139,14 +162,37 @@ export const Room = ({ roomId, userName, isHost, onLeave }) => {
   const [isMuted, setIsMuted] = useState(false);
   const [isBuffering, setIsBuffering] = useState(false);
   const [bufferCountdown, setBufferCountdown] = useState(0);
+  const [isFullscreen, setIsFullscreen] = useState(false);
+  const [codecError, setCodecError] = useState(false);
+  const [speed, setSpeed] = useState(1);
+  const [speedMenuOpen, setSpeedMenuOpen] = useState(false);
+
+  // Subtitles
+  const [subtitleText, setSubtitleText] = useState('');
+  const [subtitleCues, setSubtitleCues] = useState([]);
+  const [subtitleEnabled, setSubtitleEnabled] = useState(false);
+  const [subtitleName, setSubtitleName] = useState('');
+  const [subUrlInput, setSubUrlInput] = useState('');
+  const subtitleFileRef = useRef(null);
+  const subtitleSourceRef = useRef('');
+
+  // Controls direction (RTL / LTR)
+  const [controlsDir, setControlsDir] = useState('rtl');
+
+  // Download manager
+  const [downloads, setDownloads] = useState([]);
 
   // Role / management state
   const [selfIsAdmin, setSelfIsAdmin] = useState(false);
   const [manageModalOpen, setManageModalOpen] = useState(false);
   const [selectedUser, setSelectedUser] = useState(null);
 
+  // Control approval system (non-admins request host/admin approval)
+  const [pendingRequest, setPendingRequest] = useState(null);
+  const [requestModalOpen, setRequestModalOpen] = useState(false);
+
   // UI states
-  const [activeTab, setActiveTab] = useState('chat'); // 'chat' | 'users'
+  const [activeTab, setActiveTab] = useState('chat'); // 'chat' | 'users' | 'downloads'
   const [isUrlModalOpen, setIsUrlModalOpen] = useState(false);
   const [isShareModalOpen, setIsShareModalOpen] = useState(false);
   const [reactions, setReactions] = useState([]);
@@ -154,6 +200,7 @@ export const Room = ({ roomId, userName, isHost, onLeave }) => {
   const [xirsysTurnActive, setXirsysTurnActive] = useState(false);
 
   const videoRef = useRef(null);
+  const playerWrapRef = useRef(null);
   const peerRef = useRef(null);
   const connectionsRef = useRef([]);
   const participantsRef = useRef(participants);
@@ -165,16 +212,26 @@ export const Room = ({ roomId, userName, isHost, onLeave }) => {
   const chatScrollRef = useRef(null);
   const chatAtBottomRef = useRef(true);
   const pendingChatShiftRef = useRef(null);
+  const downloadCtrlsRef = useRef({});
+  const activeSubtitleRef = useRef('');
+  const userSpeedRef = useRef(1);
+  const sendingReqRef = useRef(false);
+  const lastRequestRef = useRef(null);
+  const lastDriftReportRef = useRef(0);
 
-  // Sync internals
-  const clockOffsetRef = useRef(0);      // hostClock - guestClock (ms)
+  // Sync internals (upgraded engine)
+  const clockOffsetRef = useRef(0);
+  const offsetInitRef = useRef(false);
   const bestRttRef = useRef(Infinity);
-  const seqRef = useRef(0);              // host: broadcast sequence
-  const lastSeqRef = useRef(-1);         // guest: last applied sequence
-  const readyAtRef = useRef(0);          // shared play deadline after video change
+  const seqRef = useRef(0);
+  const lastSeqRef = useRef(-1);
+  const readyAtRef = useRef(0);
   const pendingAutoPlayRef = useRef(false);
   const bufferTimerRef = useRef(null);
   const leavingRef = useRef(false);
+  const fastUntilRef = useRef(0);
+  const driftSmaRef = useRef([]);
+  const pendingRequestRef = useRef(null);
 
   // Fresh refs for role checks inside event handlers
   const selfIsAdminRef = useRef(false);
@@ -186,6 +243,9 @@ export const Room = ({ roomId, userName, isHost, onLeave }) => {
   const canControl = isHost || selfIsAdmin;
   const canControlRef = useRef(canControl);
   canControlRef.current = canControl;
+  const canManage = canControl;
+  const canManageRef = useRef(canManage);
+  canManageRef.current = canManage;
 
   const { addToast } = useToast();
 
@@ -201,10 +261,12 @@ export const Room = ({ roomId, userName, isHost, onLeave }) => {
   };
   broadcastRef.current = broadcast;
 
-  // --- Host periodic sync loop: keeps everyone precisely aligned ---
+  // --- Host periodic sync loop (adaptive interval) ---
   useEffect(() => {
     if (!isHost) return;
-    const interval = setInterval(() => {
+    let timer = null;
+    const tick = () => {
+      const fast = Date.now() < fastUntilRef.current;
       if (videoRef.current && connectionsRef.current.length > 0) {
         seqRef.current += 1;
         broadcastRef.current({
@@ -213,14 +275,17 @@ export const Room = ({ roomId, userName, isHost, onLeave }) => {
           time: videoRef.current.currentTime,
           playing: !videoRef.current.paused,
           sentAt: Date.now(),
-          seq: seqRef.current
+          seq: seqRef.current,
+          duration: videoRef.current.duration || 0
         });
       }
-    }, SYNC_INTERVAL_MS);
-    return () => clearInterval(interval);
+      timer = setTimeout(tick, fast ? SYNC_FAST_INTERVAL_MS : SYNC_INTERVAL_MS);
+    };
+    timer = setTimeout(tick, SYNC_INTERVAL_MS);
+    return () => clearTimeout(timer);
   }, [isHost]);
 
-  // --- Guest clock-offset measurement (NTP-style, lowest RTT wins) ---
+  // --- Guest clock-offset measurement (NTP-style, EWMA of low-RTT samples) ---
   useEffect(() => {
     if (isHost) return;
     const measure = () => {
@@ -245,7 +310,6 @@ export const Room = ({ roomId, userName, isHost, onLeave }) => {
       if (Date.now() >= deadline) {
         clearInterval(bufferTimerRef.current);
         setIsBuffering(false);
-        // The host (reference clock) starts playback once the buffer window ends
         if (isHostRef.current) {
           const v = videoRef.current;
           if (v && v.readyState >= 2 && v.paused) {
@@ -260,24 +324,36 @@ export const Room = ({ roomId, userName, isHost, onLeave }) => {
     }, 500);
   };
 
-  // --- Latency-compensated sync application ---
+  // Play only when the element can actually play (never stalls on buffering)
+  const safePlay = (video) => {
+    if (video.readyState >= 2) {
+      return video.play().catch(() => {});
+    }
+    return new Promise((resolve) => {
+      const tryPlay = () => {
+        video.removeEventListener('canplay', tryPlay);
+        video.play().catch(() => {});
+        resolve();
+      };
+      video.addEventListener('canplay', tryPlay);
+      video.play().catch(() => {});
+    });
+  };
+
+  // --- Latency-compensated sync application (upgraded) ---
   const applySync = (data) => {
     const video = videoRef.current;
     if (!video) return;
 
     const now = Date.now();
-    // Drop stale periodic broadcasts (out-of-order / duplicates)
     if (data.seq != null) {
       if (data.seq <= lastSeqRef.current) return;
       lastSeqRef.current = data.seq;
     }
 
-    // Extrapolate the host's media position at this instant, compensating for
-    // both network latency and host/guest clock skew.
     const elapsed = (now - (data.sentAt || now) + clockOffsetRef.current) / 1000;
     let estTime = (data.time || 0) + elapsed;
 
-    // Source video changed on the host -> load it first, seek after metadata
     if (data.url && data.url !== videoUrlRef.current) {
       pendingSeekRef.current = Math.max(0, estTime);
       videoUrlRef.current = data.url;
@@ -286,54 +362,60 @@ export const Room = ({ roomId, userName, isHost, onLeave }) => {
       return;
     }
 
-    // Everyone waits for the shared pre-buffer deadline before playing
     if (readyAtRef.current && now < readyAtRef.current) return;
 
-    const maxTime = video.duration || estTime;
+    const maxTime = data.duration || video.duration || estTime;
     estTime = Math.min(estTime, maxTime);
     const drift = estTime - video.currentTime;
+
+    // Smooth the drift with a small moving average (jitter guard)
+    const sma = driftSmaRef.current;
+    sma.push(drift);
+    if (sma.length > 3) sma.shift();
+    const smoothDrift = sma.reduce((a, b) => a + b, 0) / sma.length;
+
+    // Tell the host to tighten its broadcast while we are far off
+    if (Math.abs(drift) > 0.5 && now - lastDriftReportRef.current > 5000) {
+      lastDriftReportRef.current = now;
+      connectionsRef.current.forEach((c) => c.open && c.send({ type: 'DRIFT_REPORT', drift }));
+    }
+
     const nowPlaying = !video.paused;
 
     if (data.playing !== nowPlaying) {
-      // Play/Pause transition -> align precisely and immediately
       isSyncingRef.current = true;
       if (data.playing) {
         video.currentTime = estTime;
-        video.play().catch(() => {});
-        setIsPlaying(true);
+        safePlay(video).then(() => setIsPlaying(true));
       } else {
         video.pause();
-        if (Math.abs(drift) > 0.5) video.currentTime = estTime;
+        if (Math.abs(smoothDrift) > 0.5) video.currentTime = estTime;
         setIsPlaying(false);
       }
-      video.playbackRate = 1;
+      video.playbackRate = userSpeedRef.current;
       lastCorrectionRef.current = now;
       setTimeout(() => { isSyncingRef.current = false; }, 300);
     } else if (data.playing) {
-      if (Math.abs(drift) >= HARD_DRIFT_THRESHOLD) {
-        // Big drift -> precise seek
+      if (Math.abs(smoothDrift) >= HARD_DRIFT_THRESHOLD) {
         isSyncingRef.current = true;
         video.currentTime = estTime;
-        video.playbackRate = 1;
+        video.playbackRate = userSpeedRef.current;
         lastCorrectionRef.current = now;
         setTimeout(() => { isSyncingRef.current = false; }, 300);
-      } else if (Math.abs(drift) > 0.05) {
-        // Small drift -> smooth playbackRate correction, zero visual jumps
-        video.playbackRate = 1 + Math.max(
-          -RATE_CORRECTION_LIMIT,
-          Math.min(RATE_CORRECTION_LIMIT, drift * RATE_CORRECTION_GAIN)
-        );
+      } else if (Math.abs(smoothDrift) > 0.05) {
+        const adj = Math.max(-RATE_CORRECTION_LIMIT, Math.min(RATE_CORRECTION_LIMIT, smoothDrift * RATE_CORRECTION_GAIN));
+        video.playbackRate = Math.max(0.25, Math.min(2, userSpeedRef.current * (1 + adj)));
       } else {
-        video.playbackRate = 1;
+        video.playbackRate = userSpeedRef.current;
       }
     } else {
-      if (Math.abs(drift) > 0.5) {
+      if (Math.abs(smoothDrift) > 0.5) {
         isSyncingRef.current = true;
         video.currentTime = estTime;
         lastCorrectionRef.current = now;
         setTimeout(() => { isSyncingRef.current = false; }, 300);
       }
-      video.playbackRate = 1;
+      video.playbackRate = userSpeedRef.current;
     }
   };
 
@@ -341,6 +423,71 @@ export const Room = ({ roomId, userName, isHost, onLeave }) => {
     leavingRef.current = true;
     addToast('شما توسط میزبان از اتاق حذف شدید', 'error');
     setTimeout(onLeave, 600);
+  };
+
+  // --- Control approval system (host is the arbiter, admins can vote) ---
+  const resolveRequest = (req, approved) => {
+    pendingRequestRef.current = null;
+    setPendingRequest(null);
+    setRequestModalOpen(false);
+    broadcastRef.current({ type: 'CONTROL_RESULT', reqId: req.reqId, approved, action: req.action });
+    if (approved) executeControl(req);
+  };
+
+  const executeControl = (req) => {
+    const v = videoRef.current;
+    if (!v) return;
+    if (req.action === 'toggle') {
+      togglePlayInternal();
+    } else if (req.action === 'seek') {
+      const target = Math.min(req.value || 0, v.duration || req.value || 0);
+      v.currentTime = target;
+      broadcastRef.current({ type: 'SEEK', currentTime: target, sentAt: Date.now() });
+    }
+    // 'fullscreen' is a local UX action -> the requester enters FS on approval
+  };
+
+  const approveRequest = () => {
+    const req = pendingRequestRef.current;
+    if (!req) return;
+    if (isHost) {
+      resolveRequest(req, true);
+    } else {
+      broadcastRef.current({ type: 'CONTROL_APPROVE', reqId: req.reqId });
+      setPendingRequest(null);
+      setRequestModalOpen(false);
+      addToast('درخواست تایید شد', 'success');
+    }
+  };
+
+  const rejectRequest = () => {
+    const req = pendingRequestRef.current;
+    if (!req) return;
+    if (isHost) {
+      resolveRequest(req, false);
+    } else {
+      broadcastRef.current({ type: 'CONTROL_REJECT', reqId: req.reqId });
+      setPendingRequest(null);
+      setRequestModalOpen(false);
+      addToast('درخواست رد شد', 'info');
+    }
+  };
+
+  const requestControl = (action, value) => {
+    if (sendingReqRef.current) return;
+    sendingReqRef.current = true;
+    setTimeout(() => { sendingReqRef.current = false; }, 1200);
+    const reqId = `${Date.now()}-${Math.random().toString(36).slice(2, 6)}`;
+    lastRequestRef.current = reqId;
+    broadcastRef.current({
+      type: 'CONTROL_REQUEST',
+      reqId,
+      requesterId: peerRef.current?.id,
+      requesterName: userName,
+      action,
+      value
+    });
+    addToast(`درخواست «${ACTION_LABELS[action] || action}» برای میزبان ارسال شد`, 'info');
   };
 
   const handlePeerData = (data, conn) => {
@@ -362,7 +509,8 @@ export const Room = ({ roomId, userName, isHost, onLeave }) => {
             time: videoRef.current.currentTime,
             playing: !videoRef.current.paused,
             sentAt: Date.now(),
-            seq: seqRef.current
+            seq: seqRef.current,
+            duration: videoRef.current.duration || 0
           });
         }
         break;
@@ -411,12 +559,91 @@ export const Room = ({ roomId, userName, isHost, onLeave }) => {
 
       case 'PONG': {
         const rtt = Date.now() - data.t0;
-        if (rtt < bestRttRef.current) {
-          bestRttRef.current = rtt;
-          clockOffsetRef.current = data.hostTime - (data.t0 + rtt / 2);
+        if (rtt < bestRttRef.current) bestRttRef.current = rtt;
+        if (rtt < 2000) {
+          const sample = data.hostTime - (data.t0 + rtt / 2);
+          clockOffsetRef.current = offsetInitRef.current
+            ? clockOffsetRef.current * 0.75 + sample * 0.25
+            : sample;
+          offsetInitRef.current = true;
         }
         break;
       }
+
+      case 'DRIFT_REPORT':
+        // Guest is drifting -> tighten the host broadcast for a few seconds
+        if (isHost) fastUntilRef.current = Date.now() + 6000;
+        break;
+
+      case 'CONTROL_REQUEST':
+        if (isHost) {
+          if (pendingRequestRef.current) {
+            resolveRequest(pendingRequestRef.current, false);
+          }
+          pendingRequestRef.current = {
+            reqId: data.reqId,
+            requesterId: data.requesterId,
+            requesterName: data.requesterName,
+            action: data.action,
+            value: data.value
+          };
+          setPendingRequest(pendingRequestRef.current);
+          setRequestModalOpen(true);
+          // Admins get to vote too
+          connectionsRef.current.forEach((c) => {
+            const part = participantsRef.current.find((p) => p.id === c.peer);
+            if (part && part.isAdmin && c.open) {
+              c.send({ type: 'CONTROL_REQUEST_VIEW', ...pendingRequestRef.current });
+            }
+          });
+        }
+        break;
+
+      case 'CONTROL_REQUEST_VIEW':
+        if (!isHost && canManageRef.current) {
+          pendingRequestRef.current = {
+            reqId: data.reqId,
+            requesterId: data.requesterId,
+            requesterName: data.requesterName,
+            action: data.action,
+            value: data.value
+          };
+          setPendingRequest(pendingRequestRef.current);
+          setRequestModalOpen(true);
+        }
+        break;
+
+      case 'CONTROL_APPROVE':
+        if (isHost && pendingRequestRef.current && pendingRequestRef.current.reqId === data.reqId) {
+          resolveRequest(pendingRequestRef.current, true);
+        }
+        break;
+
+      case 'CONTROL_REJECT':
+        if (isHost && pendingRequestRef.current && pendingRequestRef.current.reqId === data.reqId) {
+          resolveRequest(pendingRequestRef.current, false);
+        }
+        break;
+
+      case 'CONTROL_RESULT':
+        // Close any open approval modal matching this request
+        if (pendingRequestRef.current && pendingRequestRef.current.reqId === data.reqId) {
+          pendingRequestRef.current = null;
+          setPendingRequest(null);
+          setRequestModalOpen(false);
+        }
+        if (lastRequestRef.current === data.reqId) {
+          lastRequestRef.current = null;
+          if (data.approved) {
+            if (data.action === 'fullscreen') {
+              enterFullscreen();
+            }
+            addToast('درخواست شما تایید شد', 'success');
+          } else {
+            addToast('درخواست شما رد شد', 'error');
+          }
+        }
+        break;
 
       case 'UPDATE_ROLE':
         setParticipants((prev) =>
@@ -456,7 +683,6 @@ export const Room = ({ roomId, userName, isHost, onLeave }) => {
         config: { ...PEER_CONFIG.config, iceServers: [...PEER_CONFIG.config.iceServers] }
       };
 
-      // Auto-TURN: unless an explicit ?turn= relay was given, try Xirsys free TURN
       if (!ACTIVE_TURN) {
         const turnServers = await fetchXirsysTurn();
         if (cancelled) return;
@@ -544,7 +770,6 @@ export const Room = ({ roomId, userName, isHost, onLeave }) => {
       });
 
       if (isHost) {
-        // Send current full state to the newly joined peer right away
         if (videoRef.current) {
           seqRef.current += 1;
           conn.send({
@@ -553,11 +778,11 @@ export const Room = ({ roomId, userName, isHost, onLeave }) => {
             time: videoRef.current.currentTime,
             playing: !videoRef.current.paused,
             sentAt: Date.now(),
-            seq: seqRef.current
+            seq: seqRef.current,
+            duration: videoRef.current.duration || 0
           });
         }
       } else {
-        // Ask the host for the current state (reliable late-join catch-up)
         setTimeout(() => conn.send({ type: 'REQUEST_STATE' }), 300);
       }
     });
@@ -576,31 +801,38 @@ export const Room = ({ roomId, userName, isHost, onLeave }) => {
     });
   };
 
-  // --- Video control handlers (with latency timestamp for accurate sync) ---
-  const togglePlay = () => {
-    if (!canControlRef.current) return;
+  // --- Video control handlers ---
+  const togglePlayInternal = () => {
     if (isBuffering) {
       addToast(`ویدیو در حال بارگذاری است (${bufferCountdown}s)...`, 'info');
       return;
     }
-    if (!videoRef.current) return;
-    if (videoRef.current.paused) {
-      videoRef.current.play();
-      setIsPlaying(true);
+    const v = videoRef.current;
+    if (!v) return;
+    if (v.paused) {
+      safePlay(v).then(() => setIsPlaying(true));
       broadcastRef.current({
         type: 'PLAY',
-        currentTime: videoRef.current.currentTime,
+        currentTime: v.currentTime,
         sentAt: Date.now()
       });
     } else {
-      videoRef.current.pause();
+      v.pause();
       setIsPlaying(false);
       broadcastRef.current({
         type: 'PAUSE',
-        currentTime: videoRef.current.currentTime,
+        currentTime: v.currentTime,
         sentAt: Date.now()
       });
     }
+  };
+
+  const togglePlay = () => {
+    if (!canControlRef.current) {
+      requestControl('toggle');
+      return;
+    }
+    togglePlayInternal();
   };
 
   const handleTimeUpdate = () => {
@@ -610,12 +842,10 @@ export const Room = ({ roomId, userName, isHost, onLeave }) => {
   };
 
   const handleSeek = (e) => {
-    if (!canControlRef.current || isBuffering) return;
     const newTime = parseFloat(e.target.value);
     setCurrentTime(newTime);
-    if (videoRef.current) {
-      videoRef.current.currentTime = newTime;
-    }
+    if (!canControlRef.current || isBuffering) return;
+    if (videoRef.current) videoRef.current.currentTime = newTime;
     if (!isSyncingRef.current) {
       broadcastRef.current({
         type: 'SEEK',
@@ -625,11 +855,35 @@ export const Room = ({ roomId, userName, isHost, onLeave }) => {
     }
   };
 
+  const handleSeekRelease = (e) => {
+    if (canControlRef.current || isBuffering) return;
+    requestControl('seek', parseFloat(e.target.value));
+  };
+
+  const skipBy = (delta) => {
+    const v = videoRef.current;
+    if (!v) return;
+    const target = Math.min(v.duration || 0, Math.max(0, v.currentTime + delta));
+    setCurrentTime(target);
+    if (!canControlRef.current) {
+      requestControl('seek', target);
+      return;
+    }
+    v.currentTime = target;
+    if (!isSyncingRef.current) {
+      broadcastRef.current({ type: 'SEEK', currentTime: target, sentAt: Date.now() });
+    }
+  };
+
   const handleVideoSelect = (url, title) => {
     pendingSeekRef.current = 0;
     videoUrlRef.current = url;
     setVideoUrl(url);
+    setCodecError(false);
     setIsUrlModalOpen(false);
+    if (/\.(mkv|mks|hevc|h265|265)$/i.test(url)) {
+      addToast('MKV/H.265: در صورت پشتیبانی نشدن توسط مرورگر، از دکمه دانلود استفاده کنید', 'info');
+    }
     const readyAt = Date.now() + BUFFER_SECONDS * 1000;
     startBuffering(readyAt);
     broadcastRef.current({
@@ -648,6 +902,83 @@ export const Room = ({ roomId, userName, isHost, onLeave }) => {
     setCustomUrlInput('');
   };
 
+  // --- Fullscreen (custom wrapper so reactions & modals appear in FS) ---
+  useEffect(() => {
+    const onChange = () => setIsFullscreen(!!document.fullscreenElement);
+    document.addEventListener('fullscreenchange', onChange);
+    return () => document.removeEventListener('fullscreenchange', onChange);
+  }, []);
+
+  const enterFullscreen = () => {
+    if (!playerWrapRef.current) return;
+    if (document.fullscreenElement) {
+      document.exitFullscreen().catch(() => {});
+    } else {
+      playerWrapRef.current.requestFullscreen?.().catch(() => {});
+    }
+  };
+
+  const togglePip = () => {
+    if (!videoRef.current) return;
+    if (document.pictureInPictureElement) {
+      document.exitPictureInPicture().catch(() => {});
+    } else {
+      videoRef.current.requestPictureInPicture?.().catch(() => {});
+    }
+  };
+
+  // --- Subtitles ---
+  const loadSubtitleText = (text, name) => {
+    const cues = parseSubtitles(text);
+    subtitleSourceRef.current = text;
+    setSubtitleCues(cues);
+    setSubtitleName(name);
+    setSubtitleEnabled(cues.length > 0);
+    setSubtitleText('');
+    addToast(
+      cues.length > 0 ? `زیرنویس «${name}» با ${cues.length} بخش بارگذاری شد` : 'زیرنویس معتبری یافت نشد',
+      cues.length > 0 ? 'success' : 'error'
+    );
+  };
+
+  const loadSubtitleUrl = async (url) => {
+    try {
+      const res = await fetch(url);
+      const text = await res.text();
+      loadSubtitleText(text, url.split('/').pop().split('?')[0] || 'زیرنویس');
+    } catch {
+      addToast('بارگذاری زیرنویس ناموفق بود (CORS یا لینک نامعتبر)', 'error');
+    }
+  };
+
+  const handleSubtitleFile = (file) => {
+    if (!file) return;
+    const reader = new FileReader();
+    reader.onload = () => loadSubtitleText(String(reader.result), file.name);
+    reader.readAsText(file);
+  };
+
+  // Cue tracking loop (rAF: smooth, no jank)
+  useEffect(() => {
+    if (!subtitleEnabled || subtitleCues.length === 0) return;
+    let raf;
+    const loop = () => {
+      const v = videoRef.current;
+      if (v) {
+        const t = v.currentTime;
+        const cue = subtitleCues.find((c) => t >= c.start && t <= c.end);
+        const text = cue ? cue.text : '';
+        if (text !== activeSubtitleRef.current) {
+          activeSubtitleRef.current = text;
+          setSubtitleText(text);
+        }
+      }
+      raf = requestAnimationFrame(loop);
+    };
+    raf = requestAnimationFrame(loop);
+    return () => cancelAnimationFrame(raf);
+  }, [subtitleEnabled, subtitleCues]);
+
   // --- Manual re-sync (no page reload: everyone aligns to the host again) ---
   const syncNow = () => {
     if (isHost) {
@@ -659,7 +990,8 @@ export const Room = ({ roomId, userName, isHost, onLeave }) => {
           time: videoRef.current.currentTime,
           playing: !videoRef.current.paused,
           sentAt: Date.now(),
-          seq: seqRef.current
+          seq: seqRef.current,
+          duration: videoRef.current.duration || 0
         });
       }
     } else {
@@ -670,7 +1002,7 @@ export const Room = ({ roomId, userName, isHost, onLeave }) => {
     addToast('همگام‌سازی مجدد انجام شد', 'success');
   };
 
-  // --- Chat (lazy loading: only the last N messages are rendered) ---
+  // --- Chat (lazy loading) ---
   const visibleMessages = messages.slice(-chatWindow);
 
   const loadOlderMessages = () => {
@@ -685,12 +1017,10 @@ export const Room = ({ roomId, userName, isHost, onLeave }) => {
     chatAtBottomRef.current = el.scrollHeight - el.scrollTop - el.clientHeight < 40;
   };
 
-  // Keep chat pinned to the bottom for new messages (unless user scrolled up)
   useLayoutEffect(() => {
     const el = chatScrollRef.current;
     if (!el) return;
     if (pendingChatShiftRef.current != null) {
-      // Keep scroll position stable while older messages load above
       el.scrollTop = el.scrollHeight - pendingChatShiftRef.current;
       pendingChatShiftRef.current = null;
     } else if (chatAtBottomRef.current) {
@@ -743,11 +1073,122 @@ export const Room = ({ roomId, userName, isHost, onLeave }) => {
     setTimeout(() => setIsCopied(false), 2000);
   };
 
-  // --- User management (host/admin) ---
-  const canManage = canControl;
-  const canManageRef = useRef(canManage);
-  canManageRef.current = canManage;
+  // --- Download manager engine ---
+  const downloadSubtitle = () => {
+    if (subtitleCues.length === 0) return;
+    const name = subtitleName || 'subtitle.srt';
+    const blob = new Blob([subtitleSourceRef.current], { type: 'text/plain' });
+    const objUrl = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = objUrl;
+    a.download = name;
+    a.click();
+    setTimeout(() => URL.revokeObjectURL(objUrl), 10000);
+    addToast(`زیرنویس «${name}» دانلود شد`, 'success');
+  };
 
+  const downloadVideo = async (url) => {
+    if (!url) return;
+    const name = url.split('/').pop().split('?')[0] || 'video.mp4';
+    const id = `${Date.now()}-${Math.random().toString(36).slice(2, 6)}`;
+    const ctrl = new AbortController();
+    downloadCtrlsRef.current[id] = ctrl;
+    setDownloads((prev) => [{ id, name, progress: 0, status: 'downloading' }, ...prev]);
+    addToast(`دانلود «${name}» شروع شد`, 'info');
+    try {
+      const res = await fetch(url, { signal: ctrl.signal });
+      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+      const total = +res.headers.get('content-length') || 0;
+      const reader = res.body.getReader();
+      const chunks = [];
+      let received = 0;
+      for (;;) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        chunks.push(value);
+        received += value.length;
+        if (total > 0) {
+          const pct = Math.round((received / total) * 100);
+          setDownloads((prev) => prev.map((d) => (d.id === id ? { ...d, progress: pct } : d)));
+        }
+      }
+      const blob = new Blob(chunks);
+      const objUrl = URL.createObjectURL(blob);
+      const a = document.createElement('a');
+      a.href = objUrl;
+      a.download = name;
+      a.click();
+      setTimeout(() => URL.revokeObjectURL(objUrl), 10000);
+      setDownloads((prev) => prev.map((d) => (d.id === id ? { ...d, status: 'done', progress: 100, size: blob.size } : d)));
+      addToast(`دانلود «${name}» کامل شد`, 'success');
+    } catch (err) {
+      if (err.name === 'AbortError') {
+        setDownloads((prev) => prev.map((d) => (d.id === id ? { ...d, status: 'cancelled' } : d)));
+        return;
+      }
+      // CORS/network blocked -> open the link so the browser handles it
+      try {
+        window.open(url, '_blank');
+        setDownloads((prev) => prev.map((d) => (d.id === id ? { ...d, status: 'done', note: 'لینک باز شد (CORS مانع نمایش پیشرفت)' } : d)));
+        addToast('دانلود مستقیم ممکن نبود؛ لینک ویدیو باز شد', 'info');
+      } catch {
+        setDownloads((prev) => prev.map((d) => (d.id === id ? { ...d, status: 'error' } : d)));
+      }
+    }
+  };
+
+  const cancelDownload = (id) => {
+    downloadCtrlsRef.current[id]?.abort();
+  };
+
+  const removeDownload = (id) => {
+    setDownloads((prev) => prev.filter((d) => d.id !== id));
+  };
+
+  // --- Keyboard shortcuts ---
+  useEffect(() => {
+    const onKey = (e) => {
+      if (e.target.tagName === 'INPUT' || e.target.tagName === 'TEXTAREA' || e.target.isContentEditable) return;
+      switch (e.key) {
+        case ' ':
+          e.preventDefault();
+          togglePlay();
+          break;
+        case 'ArrowRight':
+          skipBy(e.shiftKey ? 60 : SKIP_SECONDS);
+          break;
+        case 'ArrowLeft':
+          skipBy(-(e.shiftKey ? 60 : SKIP_SECONDS));
+          break;
+        case 'f':
+        case 'F':
+          if (canControlRef.current) enterFullscreen();
+          else requestControl('fullscreen');
+          break;
+        case 'm':
+        case 'M':
+          if (videoRef.current) {
+            videoRef.current.muted = !isMuted;
+            setIsMuted(!isMuted);
+          }
+          break;
+        case 'c':
+        case 'C':
+          setSubtitleEnabled((s) => !s);
+          break;
+        case 'd':
+        case 'D':
+          if (videoUrlRef.current) downloadVideo(videoUrlRef.current);
+          break;
+        default:
+          break;
+      }
+    };
+    window.addEventListener('keydown', onKey);
+    return () => window.removeEventListener('keydown', onKey);
+  });
+
+  // --- User management ---
   const openManageModal = (user) => {
     setSelectedUser(user);
     setManageModalOpen(true);
@@ -786,6 +1227,8 @@ export const Room = ({ roomId, userName, isHost, onLeave }) => {
     : ACTIVE_SIGNALING;
 
   const isCurrentUser = (user) => user.id === 'self' || (peerRef.current && user.id === peerRef.current.id);
+
+  const EMOJIS = ['❤️', '🔥', '😂', '👏', '😮', '🎉', '🍿'];
 
   return (
     <div className="h-dvh flex flex-col bg-black text-gray-100 relative overflow-hidden">
@@ -842,9 +1285,11 @@ export const Room = ({ roomId, userName, isHost, onLeave }) => {
         {/* Left/Center: Video Player & Controls (3 cols on lg) */}
         <div className="lg:col-span-3 flex flex-col gap-3 md:gap-4 min-h-0">
 
-          {/* Video Container with Floating Reactions */}
-          <div className="relative w-full aspect-video bg-black rounded-2xl md:rounded-3xl overflow-hidden border border-red-500/20 shadow-[0_0_40px_rgba(239,68,68,0.15)] group flex items-center justify-center gpu-layer">
-
+          {/* Player Wrapper: everything lives here so fullscreen keeps all UI */}
+          <div
+            ref={playerWrapRef}
+            className="relative w-full aspect-video bg-black rounded-2xl md:rounded-3xl overflow-hidden border border-red-500/20 shadow-[0_0_40px_rgba(239,68,68,0.15)] group flex items-center justify-center gpu-layer bg-zinc-950"
+          >
             {/* Floating Reactions Overlay */}
             <div className="absolute inset-0 pointer-events-none overflow-hidden z-20">
               {reactions.map((r) => (
@@ -859,7 +1304,6 @@ export const Room = ({ roomId, userName, isHost, onLeave }) => {
             </div>
 
             {!videoUrl ? (
-              // Placeholder when no video has been chosen yet
               <div className="absolute inset-0 flex flex-col items-center justify-center gap-4 bg-gradient-to-b from-black via-zinc-950 to-black z-10 px-4 text-center">
                 <Film className="w-12 h-12 md:w-16 md:h-16 text-red-500/70 neon-text" />
                 <p className="text-sm md:text-base text-gray-400 font-persian">
@@ -880,9 +1324,16 @@ export const Room = ({ roomId, userName, isHost, onLeave }) => {
                 playsInline
                 className="w-full h-full object-contain cursor-pointer"
                 onTimeUpdate={handleTimeUpdate}
+                onLoadStart={() => setCodecError(false)}
                 onLoadedMetadata={() => {
                   if (videoRef.current) {
                     setDuration(videoRef.current.duration);
+                  }
+                }}
+                onError={() => {
+                  if (videoRef.current?.error?.code === 4) {
+                    setCodecError(true);
+                    setIsPlaying(false);
                   }
                 }}
                 onCanPlay={() => {
@@ -894,8 +1345,7 @@ export const Room = ({ roomId, userName, isHost, onLeave }) => {
                   }
                   if (isHostRef.current && pendingAutoPlayRef.current && v.paused && Date.now() >= readyAtRef.current) {
                     pendingAutoPlayRef.current = false;
-                    v.play().catch(() => {});
-                    setIsPlaying(true);
+                    safePlay(v).then(() => setIsPlaying(true));
                     broadcastRef.current({ type: 'PLAY', currentTime: v.currentTime, sentAt: Date.now() });
                   }
                 }}
@@ -905,8 +1355,28 @@ export const Room = ({ roomId, userName, isHost, onLeave }) => {
               />
             )}
 
+            {/* Codec not supported overlay */}
+            {codecError && (
+              <div className="absolute inset-0 z-30 bg-black/85 flex flex-col items-center justify-center gap-4 p-6 text-center">
+                <Film className="w-12 h-12 md:w-16 md:h-16 text-red-500/70" />
+                <p className="text-sm md:text-base text-gray-200 font-persian">
+                  این فرمت/کدک توسط مرورگر شما پشتیبانی نمی‌شود
+                </p>
+                <p className="text-[10px] md:text-xs text-gray-500 font-persian max-w-md">
+                  MP4 (H.264) و WebM (VP9/AV1) بهترین سازگاری را دارند؛ MKV در صورت داشتن کدک پشتیبانی‌شده پخش می‌شود.
+                </p>
+                <button
+                  onClick={() => downloadVideo(videoUrlRef.current)}
+                  className="btn-primary text-xs md:text-sm"
+                >
+                  <Download className="w-4 h-4" />
+                  دانلود ویدیو
+                </button>
+              </div>
+            )}
+
             {/* Buffering overlay (10s pre-buffer after a video change) */}
-            {isBuffering && videoUrl && (
+            {isBuffering && videoUrl && !codecError && (
               <div className="absolute inset-0 z-30 bg-black/70 backdrop-blur-sm flex flex-col items-center justify-center gap-3">
                 <Loader2 className="w-10 h-10 md:w-14 md:h-14 text-red-500 animate-spin" />
                 <p className="text-sm md:text-base text-gray-200 font-persian">در حال بارگذاری ویدیو...</p>
@@ -917,11 +1387,20 @@ export const Room = ({ roomId, userName, isHost, onLeave }) => {
               </div>
             )}
 
-            {/* Video Overlay Controls on Hover */}
-            <div className={`absolute inset-0 bg-gradient-to-t from-black/90 via-transparent to-black/40 opacity-0 group-hover:opacity-100 transition-opacity duration-300 flex flex-col justify-between p-3 md:p-6 z-10 overlay-coarse ${canControl ? '' : 'pointer-events-none'}`}>
+            {/* Subtitle overlay (custom-rendered, works in fullscreen too) */}
+            {subtitleEnabled && subtitleText && !codecError && (
+              <div className="absolute left-1/2 -translate-x-1/2 bottom-24 md:bottom-32 z-[15] pointer-events-none w-[90%] max-w-3xl">
+                <p className="text-center text-base md:text-2xl font-bold text-white subtitle-text leading-relaxed">
+                  {subtitleText}
+                </p>
+              </div>
+            )}
+
+            {/* Video Overlay Controls (interactive children re-enable clicks) */}
+            <div className={`absolute inset-0 bg-gradient-to-t from-black/90 via-transparent to-black/40 opacity-0 group-hover:opacity-100 transition-opacity duration-300 flex flex-col justify-between p-3 md:p-6 z-10 overlay-coarse pointer-events-none`}>
 
               {/* Top Video bar */}
-              <div className="flex items-center justify-between gap-2">
+              <div className="flex items-center justify-between gap-2 pointer-events-auto">
                 <div className="flex items-center gap-2 min-w-0">
                   <span className={`w-2 h-2 md:w-2.5 md:h-2.5 rounded-full ${connections.length > 0 ? 'bg-red-500 shadow-[0_0_10px_red] animate-pulse' : 'bg-amber-500 animate-pulse'}`}></span>
                   <span className="text-[10px] md:text-xs font-medium text-gray-300 flex items-center gap-1.5 truncate">
@@ -929,32 +1408,45 @@ export const Room = ({ roomId, userName, isHost, onLeave }) => {
                     {syncStatus}
                   </span>
                 </div>
-                {canControl && (
-                  <button
-                    onClick={() => setIsUrlModalOpen(true)}
-                    className="btn-secondary py-1.5 px-3 text-xs gap-1.5 bg-black/40 shrink-0"
-                  >
-                    <Film className="w-3.5 h-3.5 text-red-400" />
-                    <span>تغییر ویدیو</span>
-                  </button>
-                )}
+                <div className="flex items-center gap-2">
+                  {isFullscreen && (
+                    <div className="flex items-center gap-1.5 px-2 py-1.5 rounded-xl bg-black/50 border border-white/10">
+                      {EMOJIS.slice(0, 5).map((emoji) => (
+                        <button
+                          key={emoji}
+                          onClick={() => sendReaction(emoji)}
+                          className="text-xl md:text-2xl hover:scale-125 transition-transform"
+                        >
+                          {emoji}
+                        </button>
+                      ))}
+                    </div>
+                  )}
+                  {canControl && (
+                    <button
+                      onClick={() => setIsUrlModalOpen(true)}
+                      className="btn-secondary py-1.5 px-3 text-xs gap-1.5 bg-black/40"
+                    >
+                      <Film className="w-3.5 h-3.5 text-red-400" />
+                      <span className="hidden md:inline">تغییر ویدیو</span>
+                    </button>
+                  )}
+                </div>
               </div>
 
-              {/* Center big play/pause on hover if needed */}
-              {canControl && (
-                <div className="self-center">
-                  <button
-                    onClick={togglePlay}
-                    disabled={isBuffering}
-                    className="w-14 h-14 md:w-16 md:h-16 rounded-full bg-red-600/80 hover:bg-red-600 disabled:opacity-50 text-white flex items-center justify-center backdrop-blur-md shadow-[0_0_30px_rgba(239,68,68,0.5)] transition-all transform hover:scale-110 active:scale-95"
-                  >
-                    {isBuffering ? <Loader2 className="w-7 h-7 animate-spin" /> : (isPlaying ? <Pause className="w-7 h-7 md:w-8 md:h-8" /> : <Play className="w-7 h-7 md:w-8 md:h-8 ml-1" />)}
-                  </button>
-                </div>
-              )}
+              {/* Center big play/pause */}
+              <div className="self-center pointer-events-auto">
+                <button
+                  onClick={togglePlay}
+                  disabled={isBuffering}
+                  className="w-14 h-14 md:w-16 md:h-16 rounded-full bg-red-600/80 hover:bg-red-600 disabled:opacity-50 text-white flex items-center justify-center backdrop-blur-md shadow-[0_0_30px_rgba(239,68,68,0.5)] transition-all transform hover:scale-110 active:scale-95"
+                >
+                  {isBuffering ? <Loader2 className="w-7 h-7 animate-spin" /> : (isPlaying ? <Pause className="w-7 h-7 md:w-8 md:h-8" /> : <Play className="w-7 h-7 md:w-8 md:h-8 ml-1" />)}
+                </button>
+              </div>
 
               {/* Bottom Video Controls Bar */}
-              <div className="flex flex-col gap-2.5 md:gap-3">
+              <div className="flex flex-col gap-2.5 md:gap-3 pointer-events-auto" dir={controlsDir}>
                 {/* Progress bar */}
                 <input
                   type="range"
@@ -962,19 +1454,41 @@ export const Room = ({ roomId, userName, isHost, onLeave }) => {
                   max={duration || 100}
                   value={currentTime}
                   onChange={handleSeek}
-                  disabled={!canControl || isBuffering}
+                  onPointerUp={handleSeekRelease}
+                  disabled={isBuffering}
                   className="neon-range w-full"
                 />
 
-                <div className="flex items-center justify-between gap-2 text-[10px] md:text-xs text-gray-300">
-                  <div className="flex items-center gap-2 md:gap-4 min-w-0">
-                    {canControl && (
-                      <button onClick={togglePlay} disabled={isBuffering} className="hover:text-red-400 transition-colors">
-                        {isBuffering ? <Loader2 className="w-4 h-4 md:w-5 md:h-5 animate-spin" /> : (isPlaying ? <Pause className="w-4 h-4 md:w-5 md:h-5" /> : <Play className="w-4 h-4 md:w-5 md:h-5" />)}
-                      </button>
+                <div className="flex items-center justify-between gap-2 text-[10px] md:text-xs text-gray-300 flex-wrap">
+                  {/* Transport controls: RTL/LTR aware */}
+                  <div className="flex items-center gap-1.5 md:gap-2">
+                    {controlsDir === 'rtl' ? (
+                      <>
+                        <button onClick={() => skipBy(-SKIP_SECONDS)} title="عقب ۱۰ ثانیه" className="p-1.5 hover:text-red-400 transition-colors rounded-lg hover:bg-red-500/10">
+                          <Rewind className="w-4 h-4 md:w-5 md:h-5" />
+                        </button>
+                        <button onClick={togglePlay} disabled={isBuffering} className="p-1.5 hover:text-red-400 transition-colors rounded-lg hover:bg-red-500/10">
+                          {isBuffering ? <Loader2 className="w-4 h-4 md:w-5 md:h-5 animate-spin" /> : (isPlaying ? <Pause className="w-4 h-4 md:w-5 md:h-5" /> : <Play className="w-4 h-4 md:w-5 md:h-5" />)}
+                        </button>
+                        <button onClick={() => skipBy(SKIP_SECONDS)} title="جلو ۱۰ ثانیه" className="p-1.5 hover:text-red-400 transition-colors rounded-lg hover:bg-red-500/10">
+                          <FastForward className="w-4 h-4 md:w-5 md:h-5" />
+                        </button>
+                      </>
+                    ) : (
+                      <>
+                        <button onClick={() => skipBy(SKIP_SECONDS)} title="Forward 10s" className="p-1.5 hover:text-red-400 transition-colors rounded-lg hover:bg-red-500/10">
+                          <FastForward className="w-4 h-4 md:w-5 md:h-5" />
+                        </button>
+                        <button onClick={togglePlay} disabled={isBuffering} className="p-1.5 hover:text-red-400 transition-colors rounded-lg hover:bg-red-500/10">
+                          {isBuffering ? <Loader2 className="w-4 h-4 md:w-5 md:h-5 animate-spin" /> : (isPlaying ? <Pause className="w-4 h-4 md:w-5 md:h-5" /> : <Play className="w-4 h-4 md:w-5 md:h-5" />)}
+                        </button>
+                        <button onClick={() => skipBy(-SKIP_SECONDS)} title="Back 10s" className="p-1.5 hover:text-red-400 transition-colors rounded-lg hover:bg-red-500/10">
+                          <Rewind className="w-4 h-4 md:w-5 md:h-5" />
+                        </button>
+                      </>
                     )}
 
-                    <div className="flex items-center gap-2">
+                    <div className="flex items-center gap-1.5 md:gap-2">
                       <button
                         onClick={() => {
                           if (videoRef.current) {
@@ -982,7 +1496,7 @@ export const Room = ({ roomId, userName, isHost, onLeave }) => {
                             setIsMuted(!isMuted);
                           }
                         }}
-                        className="hover:text-red-400 transition-colors"
+                        className="p-1.5 hover:text-red-400 transition-colors rounded-lg hover:bg-red-500/10"
                       >
                         {isMuted ? <VolumeX className="w-4 h-4 md:w-5 md:h-5 text-red-400" /> : <Volume2 className="w-4 h-4 md:w-5 md:h-5" />}
                       </button>
@@ -998,41 +1512,135 @@ export const Room = ({ roomId, userName, isHost, onLeave }) => {
                           setIsMuted(v === 0);
                           if (videoRef.current) videoRef.current.volume = v;
                         }}
-                        className="neon-range w-16 md:w-20 hidden md:block"
+                        className="neon-range w-14 md:w-20 hidden md:block"
                       />
                     </div>
 
+                    {/* Speed menu */}
+                    <div className="relative">
+                      <button
+                        onClick={() => setSpeedMenuOpen((s) => !s)}
+                        className="p-1.5 hover:text-red-400 transition-colors rounded-lg hover:bg-red-500/10 font-mono"
+                        title="سرعت پخش"
+                      >
+                        {speed}x
+                      </button>
+                      {speedMenuOpen && (
+                        <div className="absolute bottom-8 right-0 z-40 bg-zinc-950 border border-red-500/30 rounded-xl p-1.5 space-y-0.5 shadow-2xl">
+                          {SPEEDS.map((s) => (
+                            <button
+                              key={s}
+                              onClick={() => {
+                                userSpeedRef.current = s;
+                                setSpeed(s);
+                                setSpeedMenuOpen(false);
+                                if (videoRef.current) videoRef.current.playbackRate = s;
+                              }}
+                              className={`block w-full text-left px-3 py-1.5 rounded-lg text-xs transition-colors ${s === speed ? 'bg-red-500/20 text-red-400' : 'hover:bg-white/5 text-gray-300'}`}
+                            >
+                              {s}x
+                            </button>
+                          ))}
+                        </div>
+                      )}
+                    </div>
+
+                    {/* Subtitle toggle */}
+                    <button
+                      onClick={() => setSubtitleEnabled((s) => !s)}
+                      disabled={subtitleCues.length === 0}
+                      title="زیرنویس (C)"
+                      className={`p-1.5 transition-colors rounded-lg hover:bg-red-500/10 disabled:opacity-30 ${subtitleEnabled && subtitleCues.length ? 'text-red-400' : 'hover:text-red-400'}`}
+                    >
+                      <Subtitles className="w-4 h-4 md:w-5 md:h-5" />
+                    </button>
+
+                    {/* RTL / LTR toggle */}
+                    <button
+                      onClick={() => setControlsDir((d) => (d === 'rtl' ? 'ltr' : 'rtl'))}
+                      title="تغییر جهت دکمه‌ها (RTL/LTR)"
+                      className="p-1.5 hover:text-red-400 transition-colors rounded-lg hover:bg-red-500/10"
+                    >
+                      <Languages className="w-4 h-4 md:w-5 md:h-5" />
+                    </button>
+                  </div>
+
+                  <div className="flex items-center gap-1.5 md:gap-3">
                     <span className="tabular-nums whitespace-nowrap">
                       {Math.floor(currentTime / 60)}:{Math.floor(currentTime % 60).toString().padStart(2, '0')} / {Math.floor(duration / 60)}:{Math.floor(duration % 60).toString().padStart(2, '0')}
                     </span>
-                  </div>
-
-                  <div className="flex items-center gap-2 md:gap-3 shrink-0">
+                    <button
+                      onClick={togglePip}
+                      title="تصویر در تصویر"
+                      className="p-1.5 hover:text-red-400 transition-colors rounded-lg hover:bg-red-500/10"
+                    >
+                      <PictureInPicture className="w-4 h-4 md:w-5 md:h-5" />
+                    </button>
                     <button
                       onClick={() => {
-                        if (videoRef.current) {
-                          if (document.fullscreenElement) {
-                            document.exitFullscreen();
-                          } else {
-                            videoRef.current.requestFullscreen?.();
-                          }
+                        if (!canControlRef.current) {
+                          requestControl('fullscreen');
+                          return;
                         }
+                        enterFullscreen();
                       }}
-                      className="hover:text-red-400 transition-colors flex items-center gap-1"
+                      className="p-1.5 hover:text-red-400 transition-colors rounded-lg hover:bg-red-500/10 flex items-center gap-1"
                     >
-                      <Maximize className="w-4 h-4 md:w-5 md:h-5" />
-                      <span className="hidden md:inline">تمام صفحه</span>
+                      {isFullscreen ? <Minimize className="w-4 h-4 md:w-5 md:h-5" /> : <Maximize className="w-4 h-4 md:w-5 md:h-5" />}
+                      <span className="hidden md:inline">{isFullscreen ? 'خروج' : 'تمام صفحه'}</span>
                     </button>
                   </div>
                 </div>
               </div>
             </div>
 
+            {/* Control request approval modal (rendered inside wrapper: visible in fullscreen) */}
+            {requestModalOpen && pendingRequest && (
+              <div className="absolute inset-0 z-40 flex items-center justify-center p-4 bg-black/60 backdrop-blur-sm">
+                <div className="w-full max-w-sm bg-zinc-950 border border-red-500/30 rounded-2xl p-5 shadow-2xl shadow-red-900/40 animate-slide-up">
+                  <div className="absolute -top-16 -left-16 w-40 h-40 bg-red-600/10 rounded-full blur-[80px] pointer-events-none"></div>
+                  <div className="relative">
+                    <div className="flex items-center gap-3 mb-4">
+                      <div className="w-10 h-10 rounded-xl bg-red-600/20 border border-red-500/30 flex items-center justify-center font-bold text-red-300">
+                        {pendingRequest.requesterName.charAt(0)}
+                      </div>
+                      <div>
+                        <h3 className="text-sm font-bold text-white">درخواست کنترل</h3>
+                        <p className="text-[10px] text-gray-400">{pendingRequest.requesterName}</p>
+                      </div>
+                    </div>
+                    <div className="rounded-xl bg-black/40 border border-white/10 p-3 text-xs text-gray-200 mb-4">
+                      <div className="flex justify-between mb-1">
+                        <span className="text-gray-500">عملیات:</span>
+                        <span className="text-red-400 font-bold">{ACTION_LABELS[pendingRequest.action] || pendingRequest.action}</span>
+                      </div>
+                      {pendingRequest.action === 'seek' && (
+                        <div className="flex justify-between">
+                          <span className="text-gray-500">زمان:</span>
+                          <span className="font-mono">{fmtTime(pendingRequest.value)}</span>
+                        </div>
+                      )}
+                    </div>
+                    <div className="flex gap-2">
+                      <button onClick={approveRequest} className="btn-primary flex-1 py-2.5 text-xs gap-1.5">
+                        <Check className="w-4 h-4" />
+                        تایید
+                      </button>
+                      <button onClick={rejectRequest} className="btn-secondary flex-1 py-2.5 text-xs gap-1.5 hover:border-red-500/70 hover:text-red-400">
+                        <X className="w-4 h-4" />
+                        رد
+                      </button>
+                    </div>
+                  </div>
+                </div>
+              </div>
+            )}
+
             {/* Non-controller hint */}
-            {!canControl && videoUrl && (
+            {!canControl && videoUrl && !requestModalOpen && (
               <div className="absolute top-14 md:top-16 left-1/2 -translate-x-1/2 z-10 pointer-events-none">
                 <span className="text-[10px] md:text-xs px-2.5 py-1 rounded-full bg-black/60 border border-white/10 text-gray-400 whitespace-nowrap">
-                  کنترل توسط میزبان/ادمین انجام می‌شود
+                  دکمه‌ها درخواست تایید می‌فرستند
                 </span>
               </div>
             )}
@@ -1042,7 +1650,7 @@ export const Room = ({ roomId, userName, isHost, onLeave }) => {
           <div className="bg-zinc-950/80 border border-white/10 rounded-2xl p-2.5 md:p-3 flex items-center justify-between px-3 md:px-6 backdrop-blur-xl flex-wrap gap-2 shrink-0">
             <span className="text-[10px] md:text-xs font-medium text-gray-400 hidden sm:inline">واکنش سریع:</span>
             <div className="flex items-center gap-2 md:gap-6 mx-auto sm:mx-0 flex-wrap justify-center">
-              {['❤️', '🔥', '😂', '👏', '😮', '🎉', '🍿'].map((emoji) => (
+              {EMOJIS.map((emoji) => (
                 <button
                   key={emoji}
                   onClick={() => sendReaction(emoji)}
@@ -1055,11 +1663,11 @@ export const Room = ({ roomId, userName, isHost, onLeave }) => {
           </div>
         </div>
 
-        {/* Right Sidebar: Tabs (Chat, Users) */}
+        {/* Right Sidebar: Tabs (Chat, Users, Downloads) */}
         <div className="lg:col-span-1 bg-zinc-950/80 backdrop-blur-xl rounded-2xl md:rounded-3xl flex flex-col h-[42dvh] lg:h-auto lg:min-h-0 border border-white/10 overflow-hidden shrink-0">
 
           {/* Sidebar Tabs Header */}
-          <div className="grid grid-cols-2 border-b border-white/5 bg-black/40 shrink-0">
+          <div className="grid grid-cols-3 border-b border-white/5 bg-black/40 shrink-0">
             <button
               onClick={() => setActiveTab('chat')}
               className={`py-2.5 md:py-3 text-xs md:text-sm font-bold transition-colors flex items-center justify-center gap-1.5 ${
@@ -1078,9 +1686,18 @@ export const Room = ({ roomId, userName, isHost, onLeave }) => {
               <Users className="w-3.5 h-3.5 md:w-4 md:h-4" />
               <span>اعضا ({participants.length})</span>
             </button>
+            <button
+              onClick={() => setActiveTab('downloads')}
+              className={`py-2.5 md:py-3 text-xs md:text-sm font-bold transition-colors flex items-center justify-center gap-1.5 ${
+                activeTab === 'downloads' ? 'text-red-400 border-b-2 border-red-500 bg-red-500/10 shadow-[0_0_20px_rgba(239,68,68,0.15)]' : 'text-gray-400 hover:text-white'
+              }`}
+            >
+              <Download className="w-3.5 h-3.5 md:w-4 md:h-4" />
+              <span>دانلود</span>
+            </button>
           </div>
 
-          {/* Tab Content: Chat (bounded height + lazy loading + inner scroll) */}
+          {/* Tab Content: Chat */}
           {activeTab === 'chat' && (
             <div className="flex-1 min-h-0 flex flex-col p-2.5 md:p-4 overflow-hidden">
               <div
@@ -1128,7 +1745,7 @@ export const Room = ({ roomId, userName, isHost, onLeave }) => {
             </div>
           )}
 
-          {/* Tab Content: Users (with role management) */}
+          {/* Tab Content: Users */}
           {activeTab === 'users' && (
             <div className="flex-1 min-h-0 p-2.5 md:p-4 overflow-y-auto space-y-2.5 chat-scroll">
               {participants.map((user, idx) => {
@@ -1171,6 +1788,66 @@ export const Room = ({ roomId, userName, isHost, onLeave }) => {
                   برای مدیریت هر کاربر روی کارت او کلیک کنید
                 </p>
               )}
+            </div>
+          )}
+
+          {/* Tab Content: Downloads (manager) */}
+          {activeTab === 'downloads' && (
+            <div className="flex-1 min-h-0 p-2.5 md:p-4 overflow-y-auto space-y-2.5 chat-scroll">
+              <button
+                onClick={() => downloadVideo(videoUrlRef.current)}
+                disabled={!videoUrl}
+                className="btn-primary w-full py-2.5 text-xs gap-1.5 disabled:opacity-40"
+              >
+                <Download className="w-4 h-4" />
+                دانلود ویدیوی فعلی
+              </button>
+              <button
+                onClick={() => subtitleCues.length > 0 && downloadSubtitle()}
+                disabled={subtitleCues.length === 0}
+                className="btn-secondary w-full py-2.5 text-xs gap-1.5 disabled:opacity-40"
+              >
+                <Subtitles className="w-4 h-4 text-red-400" />
+                دانلود زیرنویس ({subtitleName || 'خاموش'})
+              </button>
+
+              <div className="pt-2 border-t border-white/10 space-y-2">
+                {downloads.length === 0 ? (
+                  <p className="text-center text-[10px] text-gray-600 py-4">
+                    هنوز دانلودی انجام نشده است
+                  </p>
+                ) : (
+                  downloads.map((d) => (
+                    <div key={d.id} className="glass-card p-2.5 rounded-xl">
+                      <div className="flex items-center justify-between gap-2 mb-1.5">
+                        <span className="text-[10px] text-gray-300 truncate font-mono" dir="ltr">{d.name}</span>
+                        <div className="flex items-center gap-1 shrink-0">
+                          {d.status === 'downloading' && (
+                            <button onClick={() => cancelDownload(d.id)} className="p-1 text-red-400 hover:bg-red-500/10 rounded-md" title="لغو">
+                              <X className="w-3.5 h-3.5" />
+                            </button>
+                          )}
+                          <button onClick={() => removeDownload(d.id)} className="p-1 text-gray-500 hover:text-red-400 hover:bg-red-500/10 rounded-md" title="حذف از لیست">
+                            <Trash2 className="w-3.5 h-3.5" />
+                          </button>
+                        </div>
+                      </div>
+                      <div className="h-1.5 rounded-full bg-white/5 overflow-hidden">
+                        <div
+                          className={`h-full rounded-full transition-all ${d.status === 'done' ? 'bg-emerald-500' : d.status === 'error' || d.status === 'cancelled' ? 'bg-gray-600' : 'bg-gradient-to-r from-red-600 to-orange-500'}`}
+                          style={{ width: `${d.progress}%` }}
+                        ></div>
+                      </div>
+                      <div className="flex justify-between items-center mt-1">
+                        <span className={`text-[9px] ${d.status === 'done' ? 'text-emerald-400' : d.status === 'error' ? 'text-red-400' : d.status === 'cancelled' ? 'text-gray-500' : 'text-red-300'}`}>
+                          {d.status === 'downloading' ? `در حال دانلود... ${d.progress}%` : d.status === 'done' ? 'کامل شد' : d.status === 'cancelled' ? 'لغو شد' : 'خطا'}
+                        </span>
+                        {d.note && <span className="text-[8px] text-gray-500">{d.note}</span>}
+                      </div>
+                    </div>
+                  ))
+                )}
+              </div>
             </div>
           )}
 
@@ -1223,10 +1900,10 @@ export const Room = ({ roomId, userName, isHost, onLeave }) => {
         </div>
       </Modal>
 
-      {/* Change Video Modal (direct URL only - no test videos) */}
-      <Modal isOpen={isUrlModalOpen} onClose={() => setIsUrlModalOpen(false)} title="تغییر ویدیو">
+      {/* Change Video Modal (URL + Subtitles) */}
+      <Modal isOpen={isUrlModalOpen} onClose={() => setIsUrlModalOpen(false)} title="تغییر ویدیو و زیرنویس">
         <div className="space-y-4">
-          <p className="text-sm text-gray-300 font-persian">لینک مستقیم ویدیو را وارد کنید (MP4/WebM):</p>
+          <p className="text-sm text-gray-300 font-persian">لینک مستقیم ویدیو را وارد کنید (MP4/WebM/MKV):</p>
 
           <form onSubmit={handleCustomUrlSubmit} className="space-y-3">
             <label className="block text-xs text-gray-400">لینک مستقیم (URL):</label>
@@ -1247,6 +1924,50 @@ export const Room = ({ roomId, userName, isHost, onLeave }) => {
               پس از تایید، برای هماهنگی همهٔ کاربران {BUFFER_SECONDS} ثانیه صبر می‌شود و سپس پخش شروع می‌شود.
             </p>
           </form>
+
+          <div className="pt-3 border-t border-white/10 space-y-3">
+            <label className="block text-xs text-gray-400">زیرنویس (SRT / WebVTT):</label>
+            <div className="flex gap-2">
+              <input
+                type="url"
+                value={subUrlInput}
+                onChange={(e) => setSubUrlInput(e.target.value)}
+                placeholder="https://.../movie.srt"
+                className="input-field text-xs py-2"
+              />
+              <button
+                onClick={() => {
+                  if (!subUrlInput.trim()) return;
+                  loadSubtitleUrl(subUrlInput.trim());
+                  setSubUrlInput('');
+                }}
+                className="btn-secondary py-2 px-4 text-xs whitespace-nowrap shrink-0"
+              >
+                بارگذاری
+              </button>
+            </div>
+            <div className="flex items-center justify-between gap-2">
+              <label className="btn-secondary flex-1 py-2 text-xs gap-1.5 cursor-pointer">
+                <Subtitles className="w-3.5 h-3.5 text-red-400" />
+                آپلود فایل زیرنویس
+                <input
+                  ref={subtitleFileRef}
+                  type="file"
+                  accept=".srt,.vtt,.txt"
+                  className="hidden"
+                  onChange={(e) => {
+                    handleSubtitleFile(e.target.files?.[0]);
+                    e.target.value = '';
+                  }}
+                />
+              </label>
+              {subtitleName && (
+                <span className="text-[9px] text-emerald-400 truncate font-mono" dir="ltr">
+                  ✓ {subtitleName}
+                </span>
+              )}
+            </div>
+          </div>
         </div>
       </Modal>
 
