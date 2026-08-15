@@ -13,15 +13,17 @@ export function App() {
   });
   const [isLoading, setIsLoading] = useState(true);
 
-  // Check URL search params on load for quick room join via shared link
-  useEffect(() => {
+  // Read invite room id from the URL on load (opened via shared room link)
+  const [inviteRoomId] = useState(() => {
     const params = new URLSearchParams(window.location.search);
-    const roomParam = params.get('room');
-    if (roomParam) {
-      // If room link is opened, we can pre-set room id or prompt for name
-      // For smooth UX, let's keep inRoom false until user enters name, or store roomParam
-    }
-  }, []);
+    return params.get('room') || null;
+  });
+
+  // If a user lands on the main page with no invite param, nothing to pre-fill
+  useEffect(() => {
+    if (!inviteRoomId) return;
+    // The Landing will detect inviteRoomId and route directly to name-entry
+  }, [inviteRoomId]);
 
   const handleJoinRoom = (roomId, userName, isHost) => {
     // Update URL query params without reloading page
@@ -61,7 +63,7 @@ export function App() {
           onLeave={handleLeaveRoom}
         />
       ) : (
-        <Landing onJoinRoom={handleJoinRoom} />
+        <Landing onJoinRoom={handleJoinRoom} inviteRoomId={inviteRoomId} />
       )}
     </ToastProvider>
   );

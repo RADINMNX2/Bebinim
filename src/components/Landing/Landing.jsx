@@ -1,11 +1,11 @@
 import React, { useState } from 'react';
-import { Film, Users, Play, Plus, ArrowRight, Sparkles, Tv, ShieldCheck, Zap } from 'lucide-react';
+import { Film, Users, Plus, ArrowRight, Sparkles, Tv, ShieldCheck, Zap, Link as LinkIcon, LogIn } from 'lucide-react';
 import { useToast } from '../../context/ToastContext';
 
-export const Landing = ({ onJoinRoom }) => {
+export const Landing = ({ onJoinRoom, inviteRoomId }) => {
   const [name, setName] = useState('');
   const [roomIdInput, setRoomIdInput] = useState('');
-  const [mode, setMode] = useState('menu'); // 'menu', 'create', 'join'
+  const [mode, setMode] = useState(inviteRoomId ? 'invite' : 'menu'); // 'menu' | 'create' | 'join' | 'invite'
   const { addToast } = useToast();
 
   const handleCreate = (e) => {
@@ -31,6 +31,16 @@ export const Landing = ({ onJoinRoom }) => {
     }
     onJoinRoom(roomIdInput.trim(), name.trim(), false);
     addToast('در حال اتصال به روم...', 'info');
+  };
+
+  const handleInviteJoin = (e) => {
+    e.preventDefault();
+    if (!name.trim()) {
+      addToast('لطفاً نام خود را وارد کنید', 'warning');
+      return;
+    }
+    onJoinRoom(inviteRoomId, name.trim(), false);
+    addToast('در حال اتصال به روم دعوت...', 'info');
   };
 
   return (
@@ -60,6 +70,52 @@ export const Landing = ({ onJoinRoom }) => {
           <div className="absolute -top-20 -right-20 w-60 h-60 bg-red-600/10 rounded-full blur-[80px] pointer-events-none"></div>
 
           <div className="relative z-10">
+          {mode === 'invite' && (
+            <form onSubmit={handleInviteJoin} className="space-y-6 animate-fade-in">
+              <div className="flex items-center justify-between">
+                <h3 className="text-xl font-bold text-white flex items-center gap-2 font-persian">
+                  <LogIn className="w-5 h-5 text-red-500" />
+                  ورود به روم دعوت
+                </h3>
+                <button
+                  type="button"
+                  onClick={() => setMode('menu')}
+                  className="text-sm text-gray-400 hover:text-red-400 transition-colors font-persian"
+                >
+                  بازگشت
+                </button>
+              </div>
+
+              <div className="p-4 rounded-2xl bg-red-950/30 border border-red-500/20 text-sm text-red-200 font-persian flex flex-col gap-2">
+                <div className="flex items-center gap-2">
+                  <LinkIcon className="w-4 h-4 text-red-400 flex-shrink-0" />
+                  <span>شما از طریق لینک دعوت وارد شدید. فقط نام خود را بنویسید و مستقیم وارد اتاق شوید.</span>
+                </div>
+                <div className="flex items-center gap-2">
+                  <span className="text-xs text-gray-400">کد روم:</span>
+                  <span className="font-mono font-bold text-red-300 tracking-widest" dir="ltr">{inviteRoomId}</span>
+                </div>
+              </div>
+
+              <div>
+                <label className="block text-sm font-medium text-gray-300 mb-2 font-persian">نام شما در روم</label>
+                <input
+                  type="text"
+                  value={name}
+                  onChange={(e) => setName(e.target.value)}
+                  placeholder="مثال: سارا..."
+                  className="input-field"
+                  maxLength={25}
+                />
+              </div>
+
+              <button type="submit" className="btn-primary w-full py-3.5 justify-center">
+                <span>ورود مستقیم به اتاق</span>
+                <ArrowRight className="w-5 h-5 rotate-180" />
+              </button>
+            </form>
+          )}
+
           {mode === 'menu' && (
             <div className="space-y-6 animate-fade-in">
               <div>

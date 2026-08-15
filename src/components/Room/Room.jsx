@@ -2,7 +2,7 @@ import React, { useState, useEffect, useRef } from 'react';
 import Peer from 'peerjs';
 import { 
   Play, Pause, Volume2, VolumeX, Maximize, Share2, Users, MessageSquare, 
-  Send, Link as LinkIcon, Film, LogOut, Check, Sparkles, Smile, Video as VideoIcon, Radio
+  Send, Link as LinkIcon, Film, LogOut, Check, Radio, Wifi
 } from 'lucide-react';
 import { useToast } from '../../context/ToastContext';
 import { Modal } from '../UI/Modal';
@@ -15,13 +15,39 @@ const SAMPLE_VIDEOS = [
   { title: 'Sintel (ماجراجویی)', url: 'https://commondatastorage.googleapis.com/gtv-videos-bucket/sample/Sintel.mp4' }
 ];
 
+// Multiple STUN servers to maximize NAT traversal success inside Iran
+const PEER_CONFIG = {
+  host: '0.peerjs.com',
+  port: 443,
+  secure: true,
+  config: {
+    iceServers: [
+      { urls: 'stun:stun.l.google.com:19302' },
+      { urls: 'stun:stun1.l.google.com:19302' },
+      { urls: 'stun:stun2.l.google.com:19302' },
+      { urls: 'stun:stun.cloudflare.com:3478' },
+      { urls: 'stun:stun.services.mozilla.com' },
+      { urls: 'stun:stun.1und1.de:3478' },
+      { urls: 'stun:global.stun.twilio.com:3478' }
+    ]
+  },
+  debug: 1
+};
+
+// Sync tuning parameters
+const SYNC_INTERVAL_MS = 4000;        // Host broadcasts full state every 4s
+const HARD_DRIFT_THRESHOLD = 1.5;     // Immediate seek if more than 1.5s off
+const SOFT_DRIFT_THRESHOLD = 0.6;     // Seek if more than 0.6s off and cooldown passed
+const CORRECTION_COOLDOWN_MS = 4000;  // Avoid seek-thrashing
+const MAX_CONNECT_RETRIES = 3;        // Guest retries to find the host
+const RETRY_DELAY_MS = 2500;
+
 export const Room = ({ roomId, userName, isHost, onLeave }) => {
-  const [peer, setPeer] = useState(null);
   const [connections, setConnections] = useState([]); // Array of active DataConnections
   const [participants, setParticipants] = useState([{ id: 'self', name: userName, isHost }]);
   const [messages, setMessages] = useState([]);
   const [chatInput, setChatInput] = useState('');
-  
+
   // Video state
   const [videoUrl, setVideoUrl] = useState(SAMPLE_VIDEOS[0].url);
   const [customUrlInput, setCustomUrlInput] = useState('');
@@ -30,7 +56,7 @@ export const Room = ({ roomId, userName, isHost, onLeave }) => {
   const [duration, setDuration] = useState(0);
   const [volume, setVolume] = useState(1);
   const [isMuted, setIsMuted] = useState(false);
-  
+
   // UI states
   const [activeTab, setActiveTab] = useState('chat'); // 'chat' | 'users' | 'movies'
   const [isUrlModalOpen, setIsUrlModalOpen] = useState(false);
@@ -39,55 +65,98 @@ export const Room = ({ roomId, userName, isHost, onLeave }) => {
   const [isCopied, setIsCopied] = useState(false);
 
   const videoRef = useRef(null);
-  const isSyncingRef = useRef(false); // Flag to prevent infinite loops on sync events
+  const peerRef = useRef(null);
+  const connectionsRef = useRef([]);   // Mirror of connections state (for closures)
+  const isSyncingRef = useRef(false);  // Prevents infinite loops on sync events
+  const pendingSeekRef = useRef(null); // Seek target applied after video metadata loads
+  const lastCorrectionRef = useRef(0); // Timestamp of last corrective seek
+  const videoUrlRef = useRef(videoUrl);
+  const broadcastRef = useRef(null);
   const { addToast } = useToast();
 
-  // Initialize PeerJS
-  useEffect(() => {
-    // Prefix room ID to make peer ID unique
-    const peerId = isHost ? `bebinim-host-${roomId}` : `bebinim-guest-${roomId}-${Math.random().toString(36).substring(2, 6)}`;
-    
-    const p = new Peer(peerId, {
-      debug: 1
+  useEffect(() => { videoUrlRef.current = videoUrl; }, [videoUrl]);
+
+  // Broadcast to all connected peers (uses ref so closures never go stale)
+  const broadcast = (data, excludePeerId = null) => {
+    connectionsRef.current.forEach((conn) => {
+      if (conn.open && conn.peer !== excludePeerId) {
+        conn.send(data);
+      }
     });
+  };
+  broadcastRef.current = broadcast;
+
+  // --- Initialize PeerJS ---
+  useEffect(() => {
+    const peerId = isHost
+      ? `bebinim-host-${roomId}`
+      : `bebinim-guest-${roomId}-${Math.random().toString(36).substring(2, 6)}`;
+
+    const p = new Peer(peerId, PEER_CONFIG);
+    peerRef.current = p;
 
     p.on('open', (id) => {
       console.log('Peer connected with ID:', id);
-      setPeer(p);
       if (isHost) {
         addToast(`اتاق ایجاد شد. کد اتاق: ${roomId}`, 'success');
       } else {
         addToast('در حال اتصال به میزبان...', 'info');
-        // If guest, connect to host
-        connectToHost(p, `bebinim-host-${roomId}`);
+        connectToHost(p, `bebinim-host-${roomId}`, 1);
       }
     });
 
     p.on('connection', (conn) => {
-      setupConnection(conn);
+      setupConnection(conn, 1);
     });
 
     p.on('error', (err) => {
       console.error('Peer error:', err);
-      addToast(`خطای اتصال P2P: ${err.type || err.message}`, 'error');
+      if (err.type !== 'peer-unavailable') {
+        addToast(`خطای اتصال P2P: ${err.type || err.message}`, 'error');
+      }
     });
 
     return () => {
+      connectionsRef.current = [];
       p.destroy();
     };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [roomId]);
 
-  const connectToHost = (pInstance, hostPeerId) => {
+  const connectToHost = (pInstance, hostPeerId, attempt) => {
     const conn = pInstance.connect(hostPeerId, { reliable: true });
-    setupConnection(conn);
+    setupConnection(conn, attempt);
   };
 
-  const setupConnection = (conn) => {
-    conn.on('open', () => {
-      console.log('Connected to peer:', conn.peer);
-      setConnections((prev) => [...prev, conn]);
+  const setupConnection = (conn, attempt = 1) => {
+    let settled = false;
 
-      // Send greeting / join info
+    conn.on('error', (err) => {
+      if (settled) return;
+      // Host not reachable yet -> retry a few times with backoff
+      if (err.type === 'peer-unavailable' && attempt < MAX_CONNECT_RETRIES) {
+        settled = true;
+        addToast(`میزبان هنوز آنلاین نیست، تلاش مجدد (${attempt}/${MAX_CONNECT_RETRIES - 1})...`, 'info');
+        setTimeout(() => {
+          if (peerRef.current) {
+            const retry = peerRef.current.connect(`bebinim-host-${roomId}`, { reliable: true });
+            setupConnection(retry, attempt + 1);
+          }
+        }, RETRY_DELAY_MS);
+      } else if (!settled) {
+        settled = true;
+        addToast(`خطای اتصال: ${err.type || err.message}`, 'error');
+      }
+    });
+
+    conn.on('open', () => {
+      settled = true;
+      const exists = connectionsRef.current.some((c) => c.peer === conn.peer);
+      if (!exists) {
+        connectionsRef.current = [...connectionsRef.current, conn];
+        setConnections((prev) => (prev.some((c) => c.peer === conn.peer) ? prev : [...prev, conn]));
+      }
+
       conn.send({
         type: 'JOIN_ROOM',
         name: userName,
@@ -95,17 +164,19 @@ export const Room = ({ roomId, userName, isHost, onLeave }) => {
       });
 
       if (isHost) {
-        // Send current state to new peer
-        setTimeout(() => {
-          if (videoRef.current) {
-            conn.send({
-              type: 'SYNC_STATE',
-              url: videoUrl,
-              currentTime: videoRef.current.currentTime,
-              isPlaying: !videoRef.current.paused
-            });
-          }
-        }, 1000);
+        // Send current full state to the newly joined peer right away
+        if (videoRef.current) {
+          conn.send({
+            type: 'SYNC',
+            url: videoUrlRef.current,
+            time: videoRef.current.currentTime,
+            playing: !videoRef.current.paused,
+            sentAt: Date.now()
+          });
+        }
+      } else {
+        // Ask the host for the current state (reliable late-join catch-up)
+        setTimeout(() => conn.send({ type: 'REQUEST_STATE' }), 300);
       }
     });
 
@@ -114,18 +185,83 @@ export const Room = ({ roomId, userName, isHost, onLeave }) => {
     });
 
     conn.on('close', () => {
+      connectionsRef.current = connectionsRef.current.filter((c) => c.peer !== conn.peer);
       setConnections((prev) => prev.filter((c) => c.peer !== conn.peer));
+      setParticipants((prev) => prev.filter((p) => p.id !== conn.peer));
       addToast('یکی از کاربران اتاق را ترک کرد', 'info');
     });
   };
 
-  // Broadcast to all connected peers
-  const broadcast = (data, excludePeerId = null) => {
-    connections.forEach((conn) => {
-      if (conn.open && conn.peer !== excludePeerId) {
-        conn.send(data);
+  // --- Host periodic sync loop: keeps everyone precisely aligned ---
+  useEffect(() => {
+    if (!isHost) return;
+    const interval = setInterval(() => {
+      if (videoRef.current && connectionsRef.current.length > 0) {
+        broadcastRef.current({
+          type: 'SYNC',
+          url: videoUrlRef.current,
+          time: videoRef.current.currentTime,
+          playing: !videoRef.current.paused,
+          sentAt: Date.now()
+        });
       }
-    });
+    }, SYNC_INTERVAL_MS);
+    return () => clearInterval(interval);
+  }, [isHost]);
+
+  // --- Latency-compensated sync application ---
+  // Host media time advances in real time, so by extrapolating with the elapsed
+  // wall-clock we get the host's current position at the moment of receipt,
+  // regardless of clock skew between the two machines.
+  const applySync = (data) => {
+    const video = videoRef.current;
+    if (!video) return;
+
+    const now = Date.now();
+    const elapsed = (now - (data.sentAt || now)) / 1000;
+    let estTime = (data.time || 0) + elapsed;
+
+    // Source video changed on the host -> load it first, seek after metadata
+    if (data.url && data.url !== videoUrlRef.current) {
+      pendingSeekRef.current = estTime;
+      videoUrlRef.current = data.url;
+      setVideoUrl(data.url);
+      return;
+    }
+
+    const maxTime = video.duration || estTime;
+    estTime = Math.min(estTime, maxTime);
+    const drift = estTime - video.currentTime;
+    const nowPlaying = !video.paused;
+    const bigDrift = Math.abs(drift) > HARD_DRIFT_THRESHOLD;
+    const recentCorrection = now - lastCorrectionRef.current < CORRECTION_COOLDOWN_MS;
+
+    if (data.playing !== nowPlaying) {
+      // Play/Pause transition -> align precisely and immediately
+      isSyncingRef.current = true;
+      if (data.playing) {
+        video.currentTime = estTime;
+        video.play().catch(() => {});
+        setIsPlaying(true);
+      } else {
+        video.pause();
+        if (Math.abs(drift) > 0.5) video.currentTime = estTime;
+        setIsPlaying(false);
+      }
+      lastCorrectionRef.current = now;
+      setTimeout(() => { isSyncingRef.current = false; }, 300);
+    } else if (data.playing && (bigDrift || (!recentCorrection && Math.abs(drift) > SOFT_DRIFT_THRESHOLD))) {
+      // Continuous playback correction (bounded by cooldown to stay smooth)
+      isSyncingRef.current = true;
+      video.currentTime = estTime;
+      lastCorrectionRef.current = now;
+      setTimeout(() => { isSyncingRef.current = false; }, 300);
+    } else if (!data.playing && Math.abs(drift) > 0.5) {
+      isSyncingRef.current = true;
+      video.currentTime = estTime;
+      lastCorrectionRef.current = now;
+      setTimeout(() => { isSyncingRef.current = false; }, 300);
+    }
   };
 
   const handlePeerData = (data, conn) => {
@@ -133,60 +269,48 @@ export const Room = ({ roomId, userName, isHost, onLeave }) => {
       case 'JOIN_ROOM':
         setParticipants((prev) => {
           if (prev.some((p) => p.id === conn.peer)) return prev;
-          const updated = [...prev, { id: conn.peer, name: data.name, isHost: data.isHost }];
           addToast(`${data.name} به اتاق پیوست`, 'success');
-          return updated;
+          return [...prev, { id: conn.peer, name: data.name, isHost: data.isHost }];
         });
         break;
 
-      case 'SYNC_STATE':
-        isSyncingRef.current = true;
-        if (data.url && data.url !== videoUrl) {
-          setVideoUrl(data.url);
+      case 'REQUEST_STATE':
+        if (isHost && videoRef.current) {
+          conn.send({
+            type: 'SYNC',
+            url: videoUrlRef.current,
+            time: videoRef.current.currentTime,
+            playing: !videoRef.current.paused,
+            sentAt: Date.now()
+          });
         }
-        if (videoRef.current) {
-          videoRef.current.currentTime = data.currentTime;
-          if (data.isPlaying && videoRef.current.paused) {
-            videoRef.current.play().catch(() => {});
-            setIsPlaying(true);
-          } else if (!data.isPlaying && !videoRef.current.paused) {
-            videoRef.current.pause();
-            setIsPlaying(false);
-          }
-        }
-        setTimeout(() => { isSyncingRef.current = false; }, 500);
+        break;
+
+      case 'SYNC':
+        applySync(data);
         break;
 
       case 'PLAY':
-        isSyncingRef.current = true;
-        if (videoRef.current) {
-          videoRef.current.currentTime = data.currentTime;
-          videoRef.current.play().catch(() => {});
-          setIsPlaying(true);
-        }
-        setTimeout(() => { isSyncingRef.current = false; }, 300);
+        applySync({ ...data, playing: true, time: data.currentTime });
         break;
 
       case 'PAUSE':
-        isSyncingRef.current = true;
-        if (videoRef.current) {
-          videoRef.current.currentTime = data.currentTime;
-          videoRef.current.pause();
-          setIsPlaying(false);
-        }
-        setTimeout(() => { isSyncingRef.current = false; }, 300);
+        applySync({ ...data, playing: false, time: data.currentTime });
         break;
 
       case 'SEEK':
-        isSyncingRef.current = true;
-        if (videoRef.current) {
-          videoRef.current.currentTime = data.currentTime;
+        if (videoRef.current && !isSyncingRef.current) {
+          const est = (data.currentTime || 0) + (Date.now() - (data.sentAt || Date.now())) / 1000;
+          videoRef.current.currentTime = Math.min(est, videoRef.current.duration || est);
         }
-        setTimeout(() => { isSyncingRef.current = false; }, 300);
         break;
 
       case 'CHANGE_VIDEO':
-        setVideoUrl(data.url);
+        if (data.url && data.url !== videoUrlRef.current) {
+          pendingSeekRef.current = 0;
+          videoUrlRef.current = data.url;
+          setVideoUrl(data.url);
+        }
         addToast(`ویدیو تغییر کرد به: ${data.title || 'ویدیو جدید'}`, 'info');
         break;
 
@@ -203,22 +327,24 @@ export const Room = ({ roomId, userName, isHost, onLeave }) => {
     }
   };
 
-  // Video control handlers
+  // --- Video control handlers (with latency timestamp for accurate sync) ---
   const togglePlay = () => {
     if (!videoRef.current) return;
     if (videoRef.current.paused) {
       videoRef.current.play();
       setIsPlaying(true);
-      broadcast({
+      broadcastRef.current({
         type: 'PLAY',
-        currentTime: videoRef.current.currentTime
+        currentTime: videoRef.current.currentTime,
+        sentAt: Date.now()
       });
     } else {
       videoRef.current.pause();
       setIsPlaying(false);
-      broadcast({
+      broadcastRef.current({
         type: 'PAUSE',
-        currentTime: videoRef.current.currentTime
+        currentTime: videoRef.current.currentTime,
+        sentAt: Date.now()
       });
     }
   };
@@ -236,17 +362,20 @@ export const Room = ({ roomId, userName, isHost, onLeave }) => {
       videoRef.current.currentTime = newTime;
     }
     if (!isSyncingRef.current) {
-      broadcast({
+      broadcastRef.current({
         type: 'SEEK',
-        currentTime: newTime
+        currentTime: newTime,
+        sentAt: Date.now()
       });
     }
   };
 
   const handleVideoSelect = (url, title) => {
+    pendingSeekRef.current = null;
+    videoUrlRef.current = url;
     setVideoUrl(url);
     setIsUrlModalOpen(false);
-    broadcast({
+    broadcastRef.current({
       type: 'CHANGE_VIDEO',
       url,
       title
@@ -261,7 +390,7 @@ export const Room = ({ roomId, userName, isHost, onLeave }) => {
     setCustomUrlInput('');
   };
 
-  // Chat send
+  // --- Chat ---
   const sendChatMessage = (e) => {
     e.preventDefault();
     if (!chatInput.trim()) return;
@@ -273,17 +402,17 @@ export const Room = ({ roomId, userName, isHost, onLeave }) => {
     };
 
     setMessages((prev) => [...prev, newMsg]);
-    broadcast({
+    broadcastRef.current({
       type: 'CHAT_MESSAGE',
       ...newMsg
     });
     setChatInput('');
   };
 
-  // Reactions
+  // --- Reactions ---
   const triggerFloatingReaction = (emoji) => {
     const id = Date.now() + Math.random();
-    const randomLeft = Math.floor(Math.random() * 80) + 10; // percentage
+    const randomLeft = Math.floor(Math.random() * 80) + 10;
     setReactions((prev) => [...prev, { id, emoji, left: randomLeft }]);
 
     setTimeout(() => {
@@ -293,7 +422,7 @@ export const Room = ({ roomId, userName, isHost, onLeave }) => {
 
   const sendReaction = (emoji) => {
     triggerFloatingReaction(emoji);
-    broadcast({
+    broadcastRef.current({
       type: 'REACTION',
       emoji
     });
@@ -306,6 +435,12 @@ export const Room = ({ roomId, userName, isHost, onLeave }) => {
     addToast('لینک اتاق کپی شد!', 'success');
     setTimeout(() => setIsCopied(false), 2000);
   };
+
+  const syncStatus = connections.length > 0
+    ? `همگام‌سازی زنده P2P (${connections.length} اتصال)`
+    : isHost
+      ? 'در انتظار مهمان‌ها...'
+      : 'در حال برقراری اتصال P2P...';
 
   return (
     <div className="h-screen flex flex-col bg-black text-gray-100 relative overflow-x-hidden">
@@ -347,13 +482,13 @@ export const Room = ({ roomId, userName, isHost, onLeave }) => {
 
       {/* Main Content Grid */}
       <div className="flex-1 grid grid-cols-1 lg:grid-cols-4 gap-4 p-4 md:p-6 max-w-[1600px] w-full mx-auto">
-        
+
         {/* Left/Center: Video Player & Controls (3 cols on lg) */}
         <div className="lg:col-span-3 flex flex-col gap-4">
-          
+
           {/* Video Container with Floating Reactions */}
           <div className="relative w-full aspect-video bg-black rounded-3xl overflow-hidden border border-red-500/20 shadow-[0_0_40px_rgba(239,68,68,0.15)] group flex items-center justify-center">
-            
+
             {/* Floating Reactions Overlay */}
             <div className="absolute inset-0 pointer-events-none overflow-hidden z-20">
               {reactions.map((r) => (
@@ -370,10 +505,20 @@ export const Room = ({ roomId, userName, isHost, onLeave }) => {
             <video
               ref={videoRef}
               src={videoUrl}
+              playsInline
               className="w-full h-full object-contain cursor-pointer"
               onTimeUpdate={handleTimeUpdate}
               onLoadedMetadata={() => {
-                if (videoRef.current) setDuration(videoRef.current.duration);
+                if (videoRef.current) {
+                  setDuration(videoRef.current.duration);
+                  if (pendingSeekRef.current != null) {
+                    videoRef.current.currentTime = Math.min(
+                      pendingSeekRef.current,
+                      videoRef.current.duration || pendingSeekRef.current
+                    );
+                    pendingSeekRef.current = null;
+                  }
+                }
               }}
               onPlay={() => setIsPlaying(true)}
               onPause={() => setIsPlaying(false)}
@@ -382,12 +527,15 @@ export const Room = ({ roomId, userName, isHost, onLeave }) => {
 
             {/* Video Overlay Controls on Hover */}
             <div className="absolute inset-0 bg-gradient-to-t from-black/90 via-transparent to-black/40 opacity-0 group-hover:opacity-100 transition-opacity duration-300 flex flex-col justify-between p-4 md:p-6 z-10 pointer-events-auto">
-              
+
               {/* Top Video bar */}
               <div className="flex items-center justify-between">
                 <div className="flex items-center gap-2">
-                  <span className="w-2.5 h-2.5 rounded-full bg-red-500 animate-pulse shadow-[0_0_10px_red]"></span>
-                  <span className="text-xs font-medium text-gray-300">همگام‌سازی P2P فعال</span>
+                  <span className={`w-2.5 h-2.5 rounded-full ${connections.length > 0 ? 'bg-red-500 shadow-[0_0_10px_red] animate-pulse' : 'bg-amber-500 animate-pulse'}`}></span>
+                  <span className="text-xs font-medium text-gray-300 flex items-center gap-1.5">
+                    {connections.length > 0 ? <Radio className="w-3.5 h-3.5 text-red-400" /> : <Wifi className="w-3.5 h-3.5 text-amber-400" />}
+                    {syncStatus}
+                  </span>
                 </div>
                 <button
                   onClick={() => setIsUrlModalOpen(true)}
@@ -427,7 +575,7 @@ export const Room = ({ roomId, userName, isHost, onLeave }) => {
                     </button>
 
                     <div className="flex items-center gap-2">
-                      <button 
+                      <button
                         onClick={() => {
                           if (videoRef.current) {
                             videoRef.current.muted = !isMuted;
@@ -500,7 +648,7 @@ export const Room = ({ roomId, userName, isHost, onLeave }) => {
 
         {/* Right Sidebar: Tabs (Chat, Users, Movies) */}
         <div className="lg:col-span-1 bg-zinc-950/80 backdrop-blur-xl rounded-3xl flex flex-col h-[600px] lg:h-auto border border-white/10 overflow-hidden">
-          
+
           {/* Sidebar Tabs Header */}
           <div className="grid grid-cols-3 border-b border-white/5 bg-black/40">
             <button
@@ -639,7 +787,7 @@ export const Room = ({ roomId, userName, isHost, onLeave }) => {
           </p>
 
           <div className="p-3.5 rounded-2xl bg-black/60 border border-red-500/20 flex items-center justify-between">
-            <span className="font-mono text-sm text-red-300 truncate max-w-[300px]">{window.location.href}</span>
+            <span className="font-mono text-sm text-red-300 truncate max-w-[300px]" dir="ltr">{window.location.href}</span>
             <button
               onClick={copyRoomLink}
               className="btn-primary py-1.5 px-3 text-xs gap-1.5"
@@ -659,7 +807,7 @@ export const Room = ({ roomId, userName, isHost, onLeave }) => {
       <Modal isOpen={isUrlModalOpen} onClose={() => setIsUrlModalOpen(false)} title="انتخاب یا تغییر ویدیو">
         <div className="space-y-4">
           <p className="text-sm text-gray-300 font-persian">یکی از فیلم‌های پیش‌فرض را انتخاب کنید یا لینک مستقیم ویدیوی خود را وارد نمایید:</p>
-          
+
           <div className="space-y-2">
             {SAMPLE_VIDEOS.map((movie, idx) => (
               <button
