@@ -172,6 +172,8 @@ body {
 
 .modern-input {
   position: relative;
+  display: grid;
+  grid-template: auto / 1fr;
   border-radius: 0.875rem;
   background: linear-gradient(180deg, rgba(9, 9, 11, 0.85), rgba(0, 0, 0, 0.6));
   border: 1px solid rgba(255, 255, 255, 0.12);
@@ -212,12 +214,11 @@ body {
   100% { background-position: -130% 0; }
 }
 
-/* Invisible native input: real caret, selection & IME behavior */
+/* Native input + text overlay share one grid cell (stacked in-flow), so the
+   box height comes from the content and the whole box is clickable */
 .mi-native {
-  position: absolute;
-  inset: 0;
-  width: 100%;
-  height: 100%;
+  grid-area: 1 / 1;
+  min-width: 0;
   border: 0;
   outline: 0;
   background: transparent;
@@ -239,8 +240,8 @@ body {
 
 /* Animated text overlay (scrolled in lockstep with the native input) */
 .mi-text {
-  position: absolute;
-  inset: 0;
+  grid-area: 1 / 1;
+  min-width: 0;
   overflow: hidden;
   white-space: pre;
   text-align: start;
