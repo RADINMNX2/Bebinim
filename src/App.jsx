@@ -17,9 +17,12 @@ export function App() {
     userName: '',
     isHost: false,
   });
-  const [isLoading, setIsLoading] = useState(true);
   const [inviteRoomId, setInviteRoomId] = useState(() =>
     normalizeRoomId(new URLSearchParams(window.location.search).get('room')) || null
+  );
+  // Show the intro loader once per session (and never when joining via invite link)
+  const [isLoading, setIsLoading] = useState(
+    () => !sessionStorage.getItem('bebinim-loader-seen') && !inviteRoomId
   );
 
   // Keep app state in sync with browser back/forward navigation
@@ -59,6 +62,7 @@ export function App() {
     url.searchParams.delete('room');
     window.history.pushState({}, '', url);
 
+    setInviteRoomId(null);
     setRoomState({
       inRoom: false,
       roomId: null,
@@ -69,7 +73,14 @@ export function App() {
 
   return (
     <ToastProvider>
-      {isLoading && <LoadingScreen onComplete={() => setIsLoading(false)} />}
+      {isLoading && (
+        <LoadingScreen
+          onComplete={() => {
+            sessionStorage.setItem('bebinim-loader-seen', '1');
+            setIsLoading(false);
+          }}
+        />
+      )}
       {roomState.inRoom ? (
         <Suspense
           fallback={

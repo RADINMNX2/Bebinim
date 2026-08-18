@@ -8,10 +8,14 @@ export const LoadingScreen = ({ onComplete }) => {
   const [progress, setProgress] = useState(0);
   const [isFading, setIsFading] = useState(false);
   const doneRef = useRef(false);
+  // Stable ref so a re-created `onComplete` identity can never restart the
+  // loader animation mid-flight.
+  const onCompleteRef = useRef(onComplete);
+  onCompleteRef.current = onComplete;
 
   useEffect(() => {
     if (window.matchMedia?.('(prefers-reduced-motion: reduce)').matches) {
-      const t = setTimeout(onComplete, 60);
+      const t = setTimeout(() => onCompleteRef.current(), 60);
       return () => clearTimeout(t);
     }
 
@@ -33,7 +37,7 @@ export const LoadingScreen = ({ onComplete }) => {
       doneTimer.current = setTimeout(() => {
         if (!doneRef.current) {
           doneRef.current = true;
-          onComplete();
+          onCompleteRef.current();
         }
       }, 200 + FADE_MS);
     };
@@ -44,12 +48,12 @@ export const LoadingScreen = ({ onComplete }) => {
       clearTimeout(fadeTimer.current);
       clearTimeout(doneTimer.current);
     };
-  }, [onComplete]);
+  }, []);
 
   const skip = () => {
     if (!doneRef.current) {
       doneRef.current = true;
-      onComplete();
+      onCompleteRef.current();
     }
   };
 

@@ -2,8 +2,9 @@
 // Extracts embedded subtitle tracks (S_TEXT/UTF8, S_TEXT/ASS, S_TEXT/SSA) so
 // they can be rendered with our custom subtitle overlay.
 //
-// NOTE: ebml@3 dropped the `tools.readAll` tree API, so we ship a tiny
-// self-contained EBML element walker (~50 lines) instead of a dependency.
+// The file is walked with a lightweight event-based EBML parser that never
+// builds a tree of the whole file, so even multi-GB MKVs parse in bounded
+// memory: video/audio clusters are read once and discarded.
 
 // --- Matroska element IDs we care about ---
 const ID = {
@@ -24,8 +25,6 @@ const ID = {
   Block: 0xa3,
   BlockDuration: 0x9b,
 };
-const ID_NAME = Object.fromEntries(Object.entries(ID).map(([name, id]) => [id, name]));
-const MASTER_IDS = new Set([ID.Segment, ID.Info, ID.Tracks, ID.TrackEntry, ID.Cluster, ID.BlockGroup]);
 
 // Element IDs are VINTs where the marker bit is KEPT in the value.
 const readId = (buf, pos, len) => {
@@ -58,39 +57,26 @@ const readVint = (buf, pos) => {
   return { value: val, length: len };
 };
 
-const parseChildren = (buf, start, end, depth) => {
-  const children = [];
-  if (depth > 64) return children; // malformed-file guard
+// Event-driven EBML walker: visits every element without building a tree.
+// The visitor receives (id, dataStart, dataEnd); return false to abort.
+const walkElements = (buf, start, end, depth, visitor) => {
+  if (depth > 64 || start < 0 || end > buf.length) return; // malformed-file guard
   let pos = start;
   while (pos < end - 1) {
     const idLen = idLength(buf[pos]);
-    if (idLen <= 0 || pos + idLen >= end) break;
+    if (idLen <= 0 || pos + idLen >= end) return;
     const id = readId(buf, pos, idLen);
     pos += idLen;
     const size = readVint(buf, pos);
-    if (!size || pos + size.length > end) break;
+    if (!size || pos + size.length > end) return;
     pos += size.length;
-    if (pos + size.value > end) break; // truncated element
     const dataStart = pos;
     const dataEnd = pos + size.value;
+    if (dataEnd > end) return; // truncated element
+    if (visitor(id, dataStart, dataEnd) === false) return;
     pos = dataEnd;
-    const name = ID_NAME[id];
-    if (MASTER_IDS.has(id)) {
-      children.push({ name: name || `unknown_${id.toString(16)}`, children: parseChildren(buf, dataStart, dataEnd, depth + 1) });
-    } else {
-      children.push({
-        name: name || `unknown_${id.toString(16)}`,
-        data: size.value > 0 ? buf.subarray(dataStart, dataEnd) : new Uint8Array(0)
-      });
-    }
   }
-  return children;
 };
-
-const findChild = (children, name) =>
-  children && children.find((c) => c.name === name);
-const findChildren = (children, name) =>
-  (children || []).filter((c) => c.name === name);
 
 const readUint = (el) => {
   if (!el || !el.data || el.data.length === 0) return undefined;
@@ -114,6 +100,7 @@ const stripAssOverrides = (text) =>
   text.replace(/\{[^}]*\}/g, '').replace(/\\N/gi, '\n').replace(/\\([nNh])/g, ' ').trim();
 
 // Extract every Dialogue line of an ASS/SSA block (blocks may contain several).
+// The regex is created per call so `lastIndex` never leaks across blocks.
 const parseAssBlock = (raw) => {
   const out = [];
   const lineRe = /Dialogue:\s*([^\n]*)/gi;
@@ -166,140 +153,174 @@ export const cuesToSrt = (cues) =>
 
 export const extractMkvSubtitles = async (arrayBuffer) => {
   const buf = new Uint8Array(arrayBuffer);
-  const tree = parseChildren(buf, 0, buf.length, 0);
-  const segment = tree.find((e) => e.name === 'Segment');
-  if (!segment || !segment.children) throw new Error('Segment یافت نشد');
 
-  let timecodeScale = 1e6;
-  const info = findChild(segment.children, 'Info');
-  const tc = info && findChild(info.children, 'TimecodeScale');
-  const tcVal = readUint(tc);
-  if (tcVal != null && tcVal > 0) timecodeScale = tcVal;
-
-  const subTracks = [];
-  const tracks = findChild(segment.children, 'Tracks');
-  if (tracks) {
-    for (const te of findChildren(tracks.children, 'TrackEntry')) {
-      const type = readUint(findChild(te.children, 'TrackType'));
-      const num = readUint(findChild(te.children, 'TrackNumber'));
-      const codec = readStr(findChild(te.children, 'CodecID'));
-      const lang = readStr(findChild(te.children, 'Language'));
-      const name = readStr(findChild(te.children, 'Name'));
-      if (type === 17 && /S_TEXT\/(UTF8|ASS|SSA)$/.test(codec)) {
-        subTracks.push({
-          number: num != null ? num : subTracks.length + 1,
-          codecId: codec,
-          lang,
-          name
-        });
-      }
+  // Level-0 scan: locate the Segment element (everything else is discarded).
+  let segment = null;
+  {
+    let pos = 0;
+    while (pos < buf.length - 1) {
+      const idLen = idLength(buf[pos]);
+      if (idLen <= 0 || pos + idLen >= buf.length) throw new Error('فایل MKV نامعتبر است');
+      const id = readId(buf, pos, idLen);
+      pos += idLen;
+      const size = readVint(buf, pos);
+      if (!size || pos + size.length > buf.length) throw new Error('فایل MKV نامعتبر است');
+      pos += size.length;
+      if (pos + size.value > buf.length) throw new Error('فایل MKV ناقص است');
+      if (id === ID.Segment) segment = { start: pos, end: pos + size.value };
+      pos += size.value;
     }
   }
+  if (!segment) throw new Error('Segment یافت نشد');
+
+  // Pass 1: read TimecodeScale (Info) + subtitle track list (Tracks).
+  // Both live at the start of the file and are small, so this is cheap.
+  let timecodeScale = 1e6;
+  const subTracks = [];
+
+  walkElements(buf, segment.start, segment.end, 0, (id, s, e) => {
+    if (id === ID.Info) {
+      walkElements(buf, s, e, 1, (iid, is, ie) => {
+        if (iid === ID.TimecodeScale) {
+          const v = readUint({ data: buf.subarray(is, ie) });
+          if (v != null && v > 0) timecodeScale = v;
+        }
+      });
+    } else if (id === ID.Tracks) {
+      walkElements(buf, s, e, 1, (tid, ts, te) => {
+        if (tid !== ID.TrackEntry) return;
+        const track = { number: null, type: null, codec: null, lang: null, name: null };
+        walkElements(buf, ts, te, 2, (eid, es, ee) => {
+          const data = buf.subarray(es, ee);
+          if (eid === ID.TrackType) track.type = readUint({ data });
+          else if (eid === ID.TrackNumber) track.number = readUint({ data });
+          else if (eid === ID.CodecID) track.codec = readStr({ data });
+          else if (eid === ID.Language) track.lang = readStr({ data });
+          else if (eid === ID.Name) track.name = readStr({ data });
+        });
+        if (track.type === 17 && /S_TEXT\/(UTF8|ASS|SSA)$/.test(track.codec || '')) {
+          subTracks.push({
+            number: track.number != null ? track.number : subTracks.length + 1,
+            codecId: track.codec,
+            lang: track.lang,
+            name: track.name
+          });
+        }
+      });
+    }
+  });
+
   if (subTracks.length === 0) throw new Error('ترک زیرنویس یافت نشد');
 
   const trackNumbers = new Set(subTracks.map((t) => t.number));
+  const blocksByTrack = new Map(subTracks.map((t) => [t.number, []]));
   const scaleToMs = timecodeScale / 1e6;
-  const blocks = [];
 
-  const pushBlock = (el, isSimpleBlock) => {
-    const data = el.data;
-    if (!data || data.length < 3) return;
-    const trackVint = readVint(data, 0);
+  // Only blocks belonging to subtitle tracks are retained — video/audio
+  // blocks are visited and immediately discarded (bounded memory).
+  const pushBlock = (start, end, isSimpleBlock, clusterBase, blockDurationMs) => {
+    const trackVint = readVint(buf, start);
     if (!trackVint) return;
     const trackNum = trackVint.value;
-    let off = trackVint.length;
-    if (off + 2 > data.length) return;
-    const hi = data[off];
-    const lo = data[off + 1];
+    if (!trackNumbers.has(trackNum)) return;
+    let off = start + trackVint.length;
+    if (off + 2 > end) return;
+    const hi = buf[off];
+    const lo = buf[off + 1];
     let rel = hi * 256 + lo;
     if (rel > 32767) rel -= 65536; // signed int16
     off += 2;
     // SimpleBlock: 1 flags byte after the timecode; Block (BlockGroup): none.
     if (isSimpleBlock) {
-      if (off >= data.length) return;
-      const flags = data[off];
+      if (off >= end) return;
+      const flags = buf[off];
       if (flags & 0x06) return; // laced block: not supported -> skip
       off += 1;
     }
-    if (!trackNumbers.has(trackNum)) return;
-    blocks.push({
-      trackNumber: trackNum,
-      timeMs: base + rel,
-      data: data.subarray(off),
-      durationMs: null
+    blocksByTrack.get(trackNum).push({
+      timeMs: clusterBase + rel,
+      data: buf.subarray(off, end),
+      durationMs: blockDurationMs
     });
   };
 
-  for (const child of segment.children) {
-    if (child.name !== 'Cluster') continue;
-    const clusterTc = readUint(findChild(child.children, 'Timecode'));
-    const base = clusterTc != null ? clusterTc * scaleToMs : 0;
-
-    for (const sub of child.children) {
-      if (sub.name === 'SimpleBlock') pushBlock(sub, true);
-      else if (sub.name === 'BlockGroup') {
-        const block = findChild(sub.children, 'Block');
-        if (block) pushBlock(block, false);
-        // If a duration was declared, apply it to the block we just pushed
-        // (the last one belongs to this group).
-        const durEl = findChild(sub.children, 'BlockDuration');
-        const durVal = readUint(durEl);
-        const last = blocks[blocks.length - 1];
-        if (last && durVal != null) {
-          last.durationMs = durVal * scaleToMs;
-        }
+  // Pass 2: walk Clusters, keep only subtitle blocks.
+  walkElements(buf, segment.start, segment.end, 0, (id, s, e) => {
+    if (id !== ID.Cluster) return;
+    let clusterBase = 0;
+    walkElements(buf, s, e, 1, (cid, cs, ce) => {
+      if (cid === ID.Timecode) {
+        const v = readUint({ data: buf.subarray(cs, ce) });
+        if (v != null) clusterBase = v * scaleToMs;
+      } else if (cid === ID.SimpleBlock) {
+        pushBlock(cs, ce, true, clusterBase, null);
+      } else if (cid === ID.BlockGroup) {
+        let blockRange = null;
+        let blockDurationMs = null;
+        walkElements(buf, cs, ce, 2, (bid, bs, be) => {
+          if (bid === ID.Block) blockRange = { start: bs, end: be };
+          else if (bid === ID.BlockDuration) {
+            const v = readUint({ data: buf.subarray(bs, be) });
+            if (v != null) blockDurationMs = v * scaleToMs;
+          }
+        });
+        if (blockRange) pushBlock(blockRange.start, blockRange.end, false, clusterBase, blockDurationMs);
       }
-    }
-  }
-
-  if (blocks.length === 0) throw new Error('فریم زیرنویس یافت نشد');
+    });
+  });
 
   const results = [];
   for (const t of subTracks) {
-    const trackBlocks = blocks
-      .filter((b) => b.trackNumber === t.number)
-      .sort((a, b) => a.timeMs - b.timeMs);
+    const trackBlocks = blocksByTrack.get(t.number) || [];
     if (trackBlocks.length === 0) continue;
+    trackBlocks.sort((a, b) => a.timeMs - b.timeMs);
 
     const cues = [];
     for (const b of trackBlocks) {
       if (!Number.isFinite(b.timeMs)) continue;
-      let start = b.timeMs / 1000;
+      const blockStart = b.timeMs / 1000;
+      let start = blockStart;
       let end = b.durationMs != null ? start + b.durationMs / 1000 : start + 2;
-      let texts = null;
       if (t.codecId === 'S_TEXT/ASS' || t.codecId === 'S_TEXT/SSA') {
+        // Every Dialogue line carries its own timestamps — keep them all
+        // instead of stamping the whole block with the first one.
         const parsed = parseAssBlock(new TextDecoder('utf-8').decode(b.data));
-        texts = parsed.map((p) => p.text);
-        const first = parsed[0];
-        if (first) {
-          start = first.start;
-          end = first.end;
+        for (const p of parsed) {
+          if (p.start != null && p.end != null && p.end > p.start && p.text) {
+            cues.push({ start: p.start, end: p.end, text: p.text });
+          }
         }
-      }
-      if (!texts) texts = [decodeBlockText(b.data, t.codecId)];
-      for (const text of texts) {
-        if (!text) continue;
-        if (!Number.isFinite(start) || !Number.isFinite(end) || end <= start) continue;
-        cues.push({ start, end, text });
+      } else {
+        const text = decodeBlockText(b.data, t.codecId);
+        if (text && end > start) cues.push({ start, end, text });
       }
     }
     if (cues.length === 0) continue;
 
     cues.sort((a, b) => a.start - b.start);
-    // Never let a cue overlap the next one (and never end before it starts).
-    for (let i = 0; i < cues.length - 1; i += 1) {
-      if (!Number.isFinite(cues[i].end) || cues[i].end > cues[i + 1].start) {
-        cues[i].end = cues[i + 1].start;
-      }
-      if (cues[i].end <= cues[i].start) cues[i].end = cues[i].start + 0.05;
+
+    // Drop exact duplicates (e.g. the same ASS dialogue in multiple blocks)
+    const deduped = [];
+    for (const cue of cues) {
+      const prev = deduped[deduped.length - 1];
+      if (prev && prev.start === cue.start && prev.end === cue.end && prev.text === cue.text) continue;
+      deduped.push(cue);
     }
+
+    // Never let a cue overlap the next one (and never end before it starts).
+    for (let i = 0; i < deduped.length - 1; i += 1) {
+      const cue = deduped[i];
+      if (!Number.isFinite(cue.end) || cue.end > deduped[i + 1].start) cue.end = deduped[i + 1].start;
+      if (cue.end <= cue.start) cue.end = Math.min(deduped[i + 1].start, cue.start + 0.05);
+    }
+
     results.push({
       trackNumber: t.number,
       type: t.codecId,
       language: t.lang,
       name: t.name,
-      cues,
-      srt: cuesToSrt(cues)
+      cues: deduped,
+      srt: cuesToSrt(deduped)
     });
   }
 

@@ -1,4 +1,4 @@
-import React, { useState } from 'react';
+import React, { useState, useEffect } from 'react';
 import { Film, Users, Plus, ArrowRight, Sparkles, Tv, ShieldCheck, Zap, Link as LinkIcon, LogIn } from 'lucide-react';
 import { useToast } from '../../context/ToastContext';
 
@@ -7,6 +7,11 @@ export const Landing = ({ onJoinRoom, inviteRoomId }) => {
   const [roomIdInput, setRoomIdInput] = useState('');
   const [mode, setMode] = useState(inviteRoomId ? 'invite' : 'menu'); // 'menu' | 'create' | 'join' | 'invite'
   const { addToast } = useToast();
+
+  // If the invite link disappears (browser back), don't strand the user
+  useEffect(() => {
+    if (mode === 'invite' && !inviteRoomId) setMode('menu');
+  }, [mode, inviteRoomId]);
 
   const handleNameChange = (e) => {
     const value = e.target.value;
@@ -50,6 +55,11 @@ export const Landing = ({ onJoinRoom, inviteRoomId }) => {
     e.preventDefault();
     if (!name.trim()) {
       addToast('لطفاً نام خود را وارد کنید', 'warning');
+      return;
+    }
+    if (!inviteRoomId) {
+      addToast('لینک دعوت نامعتبر است', 'error');
+      setMode('menu');
       return;
     }
     onJoinRoom(inviteRoomId, name.trim(), false);
