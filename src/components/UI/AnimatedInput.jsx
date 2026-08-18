@@ -1,5 +1,47 @@
 import React, { useEffect, useRef } from 'react';
 
+// Bidi-safe text segmentation: split the value into directionally consistent
+// runs (RTL script / LTR script / neutral) so per-character animated spans
+// never break the browser's bidi algorithm (atomic inline-blocks otherwise
+// reorder and reverse English text inside an RTL field).
+const NEUTRAL_RE = /[\s,.;:!؟?،؛()\[\]{}"'`~\-_=+/\\*|<>@#%^&$…]/u;
+const RTL_RE = /[\u0591-\u07FF\u200F\uFB1D-\uFDFD\uFE70-\uFEFC]/u;
+
+const classifyChar = (ch) => {
+  if (NEUTRAL_RE.test(ch)) return null;
+  if (/\d/.test(ch)) return 'ltr'; // ASCII digits keep LTR order inside RTL runs
+  return RTL_RE.test(ch) ? 'rtl' : 'ltr';
+};
+
+const buildSegments = (value) => {
+  const chars = Array.from(value);
+  const segments = [];
+  let current = [];
+  let type = null;
+  const flush = () => {
+    if (current.length) {
+      segments.push({ chars: current, type });
+      current = [];
+      type = null;
+    }
+  };
+  for (const ch of chars) {
+    const t = classifyChar(ch);
+    if (t === null) {
+      current.push(ch); // neutrals attach to the surrounding run
+    } else if (type === null || t === type) {
+      current.push(ch);
+      type = t;
+    } else {
+      flush();
+      current = [ch];
+      type = t;
+    }
+  }
+  flush();
+  return segments;
+};
+
 // Modern neon input with a per-character typing animation.
 // A transparent native <input> keeps full keyboard behavior (caret,
 // selection, IME, form submit); an overlay mirrors the text as animated
@@ -30,7 +72,8 @@ export const AnimatedInput = ({
     syncScroll();
   }, [value]);
 
-  const chars = Array.from(value);
+  const segments = buildSegments(value);
+  let charIndex = 0;
 
   return (
     <div
@@ -53,16 +96,20 @@ export const AnimatedInput = ({
         onScroll={syncScroll}
       />
       <div ref={textRef} dir={dir} aria-hidden="true" className={`mi-text ${fieldClassName}`}>
-        {chars.length === 0 ? (
+        {value === '' ? (
           <span className="mi-placeholder">{placeholder}</span>
         ) : (
-          chars.map((ch, i) => (
-            <span
-              key={`${i}-${ch}`}
-              className="mi-char"
-              style={{ animationDelay: `${Math.min(i * 14, 140)}ms` }}
-            >
-              {ch}
+          segments.map((seg, si) => (
+            <span key={si} className="mi-seg" dir={seg.type || 'auto'}>
+              {seg.chars.map((ch, i) => {
+                const delay = Math.min(charIndex * 14, 140);
+                charIndex += 1;
+                return (
+                  <span key={i} className="mi-char" style={{ animationDelay: `${delay}ms` }}>
+                    {ch}
+                  </span>
+                );
+              })}
             </span>
           ))
         )}

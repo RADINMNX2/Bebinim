@@ -254,6 +254,13 @@ body {
   color: #52525b;
 }
 
+/* Directionally consistent run: atomic box so outer bidi can't reorder it,
+   while its chars keep flowing in the run's own direction */
+.mi-seg {
+  display: inline-block;
+  unicode-bidi: isolate;
+}
+
 /* Per-character pop-in: new letters cascade in left-to-right */
 .mi-char {
   display: inline-block;
