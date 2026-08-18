@@ -2543,3 +2543,5 @@ export const Room = ({ roomId, userName, isHost, onLeave }) => {
     </div>
   );
 };
+
+export default Room;
