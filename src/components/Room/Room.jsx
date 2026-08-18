@@ -7,6 +7,7 @@ import {
 } from 'lucide-react';
 import { useToast } from '../../context/ToastContext';
 import { Modal } from '../UI/Modal';
+import { AnimatedInput } from '../UI/AnimatedInput';
 import { extractMkvSubtitles, cuesToSrt } from '../../utils/mkvSubtitles';
 
 // Default free STUN servers to maximize NAT traversal success inside Iran
@@ -956,9 +957,13 @@ export const Room = ({ roomId, userName, isHost, onLeave }) => {
 
       case 'ROOM_STATE': {
         // Host's authoritative roster (sent right after joining / reconnect).
-        // Drop our own peer entry AND the host's 'self' entry (id collision).
+        // Drop our own peer entry, but KEEP the host: the host's own entry in
+        // the list has id 'self' (it would collide with ours), so remap it to
+        // the real host peer id — otherwise the guest never sees the host.
         const mine = peerRef.current?.id;
-        const others = (data.participants || []).filter((p) => p.id !== mine && p.id !== 'self');
+        const others = (data.participants || [])
+          .filter((p) => p.id !== mine)
+          .map((p) => (p.id === 'self' ? { ...p, id: hostPeerId, isHost: true } : p));
         setParticipants((prev) => {
           const self = prev[0];
           return self ? [self, ...others] : prev;
@@ -2345,13 +2350,15 @@ export const Room = ({ roomId, userName, isHost, onLeave }) => {
                 <form onSubmit={handleCustomUrlSubmit} className="space-y-3">
                   <label className="block text-xs text-gray-400">لینک مستقیم (URL):</label>
                   <div className="flex gap-2">
-                    <input
+                    <AnimatedInput
                       type="url"
                       value={customUrlInput}
                       onChange={(e) => setCustomUrlInput(e.target.value)}
                       placeholder="https://.../movie.mp4"
-                      className="input-field text-xs py-2"
+                      dir="ltr"
                       autoFocus
+                      fieldClassName="py-2 px-5 text-xs"
+                      wrapperClassName="flex-1"
                     />
                     <button type="submit" className="btn-primary py-2 px-4 text-xs whitespace-nowrap shrink-0">
                       پخش
@@ -2365,12 +2372,14 @@ export const Room = ({ roomId, userName, isHost, onLeave }) => {
                 <div className="pt-3 border-t border-white/10 space-y-3">
                   <label className="block text-xs text-gray-400">زیرنویس (SRT / WebVTT):</label>
                   <div className="flex gap-2">
-                    <input
+                    <AnimatedInput
                       type="url"
                       value={subUrlInput}
                       onChange={(e) => setSubUrlInput(e.target.value)}
                       placeholder="https://.../movie.srt"
-                      className="input-field text-xs py-2"
+                      dir="ltr"
+                      fieldClassName="py-2 px-5 text-xs"
+                      wrapperClassName="flex-1"
                     />
                     <button
                       onClick={() => {
@@ -2732,13 +2741,13 @@ export const Room = ({ roomId, userName, isHost, onLeave }) => {
                   )}
                 </div>
                 <form onSubmit={sendChatMessage} className="flex items-center gap-2 shrink-0">
-                  <input
-                    type="text"
+                  <AnimatedInput
                     value={chatInput}
                     onChange={(e) => setChatInput(e.target.value)}
                     placeholder="پیام خود را بنویسید..."
-                    className="input-field py-2 text-sm flex-1"
                     autoFocus
+                    fieldClassName="py-2 px-5 text-sm"
+                    wrapperClassName="flex-1"
                   />
                   <button type="submit" aria-label="ارسال پیام" className="btn-primary p-2.5 rounded-xl shrink-0">
                     <Send className="w-5 h-5" />
@@ -2825,12 +2834,12 @@ export const Room = ({ roomId, userName, isHost, onLeave }) => {
               </div>
 
               <form onSubmit={sendChatMessage} className="flex items-center gap-2 shrink-0">
-                <input
-                  type="text"
+                <AnimatedInput
                   value={chatInput}
                   onChange={(e) => setChatInput(e.target.value)}
                   placeholder="پیام خود را بنویسید..."
-                  className="input-field py-2 text-xs md:text-sm"
+                  fieldClassName="py-2 px-5 text-xs md:text-sm"
+                  wrapperClassName="flex-1"
                 />
                 <button type="submit" aria-label="ارسال پیام" className="btn-primary p-2.5 rounded-xl shrink-0">
                   <Send className="w-4 h-4" />

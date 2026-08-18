@@ -1,6 +1,7 @@
 import React, { useState, useEffect } from 'react';
 import { Film, Users, Plus, ArrowRight, Sparkles, Tv, ShieldCheck, Zap, Link as LinkIcon, LogIn } from 'lucide-react';
 import { useToast } from '../../context/ToastContext';
+import { AnimatedInput } from '../UI/AnimatedInput';
 
 export const Landing = ({ onJoinRoom, inviteRoomId }) => {
   const [name, setName] = useState(() => sessionStorage.getItem('bebinim-name') || '');
@@ -122,13 +123,12 @@ export const Landing = ({ onJoinRoom, inviteRoomId }) => {
 
               <div>
                 <label className="block text-sm font-medium text-gray-300 mb-2 font-persian">نام شما در روم</label>
-                <input
-                  type="text"
+                <AnimatedInput
                   value={name}
                   onChange={handleNameChange}
                   placeholder="مثال: سارا..."
-                  className="input-field"
                   maxLength={25}
+                  fieldClassName="py-3.5 px-5 text-[0.95rem]"
                 />
               </div>
 
@@ -143,13 +143,12 @@ export const Landing = ({ onJoinRoom, inviteRoomId }) => {
             <div className="space-y-6 animate-fade-in">
               <div>
                 <label className="block text-sm font-medium text-gray-300 mb-2 font-persian">نام شما در روم</label>
-                <input
-                  type="text"
+                <AnimatedInput
                   value={name}
                   onChange={handleNameChange}
                   placeholder="مثال: کوروش..."
-                  className="input-field"
                   maxLength={25}
+                  fieldClassName="py-3.5 px-5 text-[0.95rem]"
                 />
               </div>
 
@@ -248,13 +247,13 @@ export const Landing = ({ onJoinRoom, inviteRoomId }) => {
 
               <div>
                 <label className="block text-sm font-medium text-gray-300 mb-2 font-persian">کد روم (Room ID)</label>
-                <input
-                  type="text"
+                <AnimatedInput
                   value={roomIdInput}
                   onChange={(e) => setRoomIdInput(normalizeRoomCode(e.target.value))}
                   placeholder="کد ۶ رقمی دریافتی از دوستتان..."
-                  className="input-field tracking-widest font-mono lowercase"
                   maxLength={12}
+                  dir="ltr"
+                  fieldClassName="py-3.5 px-5 text-[0.95rem] tracking-widest font-mono"
                 />
               </div>
 

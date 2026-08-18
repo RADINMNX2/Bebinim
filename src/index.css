@@ -168,28 +168,109 @@ body {
   transform: translateY(0);
 }
 
-/* ============ Inputs ============ */
+/* ============ Modern Animated Input (AnimatedInput) ============ */
 
-.input-field {
-  width: 100%;
-  background: rgba(0, 0, 0, 0.6);
-  border: 1px solid rgba(255, 255, 255, 0.1);
+.modern-input {
+  position: relative;
   border-radius: 0.875rem;
-  padding: 0.875rem 1.25rem;
-  color: #ffffff;
-  font-family: inherit;
-  font-size: 0.95rem;
-  transition: all 0.2s ease;
-  outline: none;
+  background: linear-gradient(180deg, rgba(9, 9, 11, 0.85), rgba(0, 0, 0, 0.6));
+  border: 1px solid rgba(255, 255, 255, 0.12);
+  box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.05), 0 4px 16px rgba(0, 0, 0, 0.35);
+  transition: border-color 0.25s ease, box-shadow 0.25s ease;
+  overflow: hidden;
 }
 
-.input-field::placeholder {
+.modern-input:focus-within {
+  border-color: rgba(239, 68, 68, 0.7);
+  box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.05),
+    0 0 0 3px rgba(239, 68, 68, 0.18),
+    0 0 28px rgba(239, 68, 68, 0.18);
+}
+
+/* Soft light sweep across the field while focused/typing */
+.modern-input::after {
+  content: '';
+  position: absolute;
+  inset: 0;
+  border-radius: inherit;
+  pointer-events: none;
+  z-index: 0;
+  background: linear-gradient(115deg, transparent 35%, rgba(239, 68, 68, 0.1) 50%, transparent 65%);
+  background-size: 220% 100%;
+  opacity: 0;
+  transition: opacity 0.35s ease;
+}
+
+.modern-input:focus-within::after {
+  opacity: 1;
+  animation: inputSweep 3s ease-in-out infinite;
+}
+
+@keyframes inputSweep {
+  0% { background-position: 130% 0; }
+  60% { background-position: -60% 0; }
+  100% { background-position: -130% 0; }
+}
+
+/* Invisible native input: real caret, selection & IME behavior */
+.mi-native {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  border: 0;
+  outline: 0;
+  background: transparent;
+  color: transparent;
+  caret-color: #ef4444;
+  overflow: hidden;
+  white-space: pre;
+  text-align: start;
+  z-index: 2;
+}
+
+.mi-native::placeholder {
+  color: transparent;
+}
+
+.mi-native::selection {
+  background: transparent;
+}
+
+/* Animated text overlay (scrolled in lockstep with the native input) */
+.mi-text {
+  position: absolute;
+  inset: 0;
+  overflow: hidden;
+  white-space: pre;
+  text-align: start;
+  color: #ffffff;
+  pointer-events: none;
+  z-index: 1;
+}
+
+.mi-placeholder {
   color: #52525b;
 }
 
-.input-field:focus {
-  border-color: #ef4444;
-  box-shadow: 0 0 0 3px rgba(239, 68, 68, 0.2), 0 0 15px rgba(239, 68, 68, 0.15);
+/* Per-character pop-in: new letters cascade in left-to-right */
+.mi-char {
+  display: inline-block;
+  animation: charIn 0.24s cubic-bezier(0.22, 1, 0.36, 1) backwards;
+  will-change: transform, opacity;
+}
+
+@keyframes charIn {
+  from {
+    opacity: 0;
+    transform: translateY(0.4em) scale(0.5);
+    filter: blur(4px);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0) scale(1);
+    filter: blur(0);
+  }
 }
 
 /* ============ Neon Red Range Slider ============ */
