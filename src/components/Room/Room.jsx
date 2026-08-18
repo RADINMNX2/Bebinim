@@ -52,19 +52,27 @@ const fetchXirsysTurn = async () => {
 
 const getUrlParams = () => new URLSearchParams(window.location.search);
 
+// Robust TURN URL parser: accepts `turn:user:pass@host`, `turn:user:pass@host:3478`,
+// `turns://user:pass@host:5349`, etc. (the old split(':') logic mangled these).
+const parseTurnParam = (raw) => {
+  if (!raw) return null;
+  const s = raw.includes('://') ? raw.replace('://', ':') : raw;
+  const m = /^turns?:([^:@/]+):([^@]+)@([^:/]+)(?::(\d+))?$/.exec(s);
+  if (!m) return null;
+  const [, username, credential, host, port] = m;
+  const secure = /^turns:/i.test(s);
+  return {
+    urls: `${secure ? 'turns:' : 'turn:'}${host}${port ? `:${port}` : ''}`,
+    username,
+    credential,
+  };
+};
+
 const buildPeerConfig = () => {
   const iceServers = [...DEFAULT_STUN_SERVERS];
 
-  const turnParam = getUrlParams().get('turn');
-  if (turnParam) {
-    const parts = turnParam.split(':');
-    const username = parts[parts.length - 2];
-    const credential = parts[parts.length - 1];
-    const turnUrl = parts.slice(0, parts.length - 2).join(':');
-    if (turnUrl.startsWith('turn:') || turnUrl.startsWith('turns:')) {
-      iceServers.push({ urls: turnUrl, username, credential });
-    }
-  }
+  const turn = parseTurnParam(getUrlParams().get('turn'));
+  if (turn) iceServers.push(turn);
 
   const config = {
     host: '0.peerjs.com',
@@ -107,9 +115,18 @@ const ACTIVE_TURN = getUrlParams().get('turn') || null;
 const SYNC_INTERVAL_MS = 2000;
 const SYNC_FAST_INTERVAL_MS = 900;
 const PING_INTERVAL_MS = 15000;
+const HEARTBEAT_INTERVAL_MS = 10000;
+const HEARTBEAT_TIMEOUT_MS = 45000;
+const MAX_RECONNECT_ATTEMPTS = 6;
+const RECONNECT_BASE_MS = 1000;
+const MAX_HOST_ID_RETRIES = 5;
+const HOST_ID_RETRY_DELAY_MS = 3000;
 const HARD_DRIFT_THRESHOLD = 1.0;
 const RATE_CORRECTION_GAIN = 0.12;
 const RATE_CORRECTION_LIMIT = 0.08;
+const DRIFT_SMA_WINDOW = 5;
+const FAST_AFTER_EVENT_MS = 5000;
+const DRIFT_REPORT_MIN_RTT = 120; // hard seeks are only safe once the clock is measured
 const BUFFER_SECONDS = 10;
 const MAX_CONNECT_RETRIES = 3;
 const RETRY_DELAY_MS = 2500;
@@ -420,6 +437,8 @@ export const Room = ({ roomId, userName, isHost, onLeave }) => {
   const [reactions, setReactions] = useState([]);
   const [isCopied, setIsCopied] = useState(false);
   const [xirsysTurnActive, setXirsysTurnActive] = useState(false);
+  const [reconnecting, setReconnecting] = useState(false);
+  const [netStats, setNetStats] = useState(null); // { rtt, offsetMs, iceType } live P2P diagnostics
 
   const videoRef = useRef(null);
   const playerWrapRef = useRef(null);
@@ -463,9 +482,15 @@ export const Room = ({ roomId, userName, isHost, onLeave }) => {
   const desiredPlayingRef = useRef(true);
   const bufferTimerRef = useRef(null);
   const leavingRef = useRef(false);
+  const kickedRef = useRef(false);
   const fastUntilRef = useRef(0);
   const driftSmaRef = useRef([]);
   const pendingRequestRef = useRef(null);
+  const heartbeatTimersRef = useRef(new Map());
+  const lastSeenRef = useRef(new Map());
+  const reconnectTimerRef = useRef(null);
+  const reconnectAttemptsRef = useRef(0);
+  const netStatsTimerRef = useRef(null);
 
   // Fresh refs for role checks inside event handlers
   const selfIsAdminRef = useRef(false);
@@ -501,11 +526,156 @@ export const Room = ({ roomId, userName, isHost, onLeave }) => {
   const broadcast = (data, excludePeerId = null) => {
     connectionsRef.current.forEach((conn) => {
       if (conn.open && conn.peer !== excludePeerId) {
-        conn.send(data);
+        try { conn.send(data); } catch (_) {}
       }
     });
   };
   broadcastRef.current = broadcast;
+
+  const hostPeerId = `bebinim-host-${roomId}`;
+
+  // Single source of truth for the host's media state (sync loop, join,
+  // REQUEST_STATE, manual re-sync and tab-return all use it).
+  const hostStateMessage = () => ({
+    type: 'SYNC',
+    url: videoUrlRef.current,
+    time: videoRef.current ? videoRef.current.currentTime : 0,
+    playing: videoRef.current ? !videoRef.current.paused : false,
+    sentAt: Date.now(),
+    seq: (seqRef.current += 1),
+    duration: videoRef.current?.duration || 0
+  });
+
+  // --- Heartbeat: kill zombie data channels that silently died ---
+  const startHeartbeat = (conn) => {
+    stopHeartbeat(conn.peer);
+    const timer = setInterval(() => {
+      if (conn.open) {
+        try { conn.send({ type: 'HEARTBEAT', t: Date.now() }); } catch (_) {}
+      }
+    }, HEARTBEAT_INTERVAL_MS);
+    heartbeatTimersRef.current.set(conn.peer, timer);
+  };
+  const stopHeartbeat = (peerId) => {
+    const timer = heartbeatTimersRef.current.get(peerId);
+    if (timer) {
+      clearInterval(timer);
+      heartbeatTimersRef.current.delete(peerId);
+    }
+  };
+
+  // --- Reconnect engine: a dropped host link no longer bounces the guest ---
+  const startReconnect = () => {
+    if (isHostRef.current || leavingRef.current || peerRef.current?.destroyed) return;
+    if (reconnectAttemptsRef.current >= MAX_RECONNECT_ATTEMPTS) {
+      addToast('اتصال به میزبان قطع شد و برقرار نشد. شما به صفحه اصلی بازگردانده شدید', 'error');
+      leavingRef.current = true;
+      setTimeout(onLeave, 700);
+      return;
+    }
+    const attempt = reconnectAttemptsRef.current + 1;
+    reconnectAttemptsRef.current = attempt;
+    setReconnecting(true);
+    addToast(`اتصال قطع شد؛ تلاش برای اتصال مجدد (${attempt}/${MAX_RECONNECT_ATTEMPTS})...`, 'info');
+    const delay = Math.min(12000, RECONNECT_BASE_MS * 2 ** (attempt - 1));
+    clearTimeout(reconnectTimerRef.current);
+    reconnectTimerRef.current = setTimeout(() => {
+      if (leavingRef.current || !peerRef.current) return;
+      try {
+        const retry = peerRef.current.connect(hostPeerId, { reliable: true, serialization: 'json' });
+        setupConnection(retry, 1);
+      } catch (_) {
+        startReconnect();
+      }
+    }, delay);
+  };
+
+  // --- Network back: instantly try to reattach if we lost the host ---
+  useEffect(() => {
+    const onOnline = () => {
+      if (leavingRef.current || isHostRef.current) return;
+      const alive = connectionsRef.current.some((c) => c.open);
+      if (!alive) startReconnect();
+    };
+    window.addEventListener('online', onOnline);
+    return () => window.removeEventListener('online', onOnline);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  // --- Zombie-channel monitor ---
+  useEffect(() => {
+    const monitor = setInterval(() => {
+      const now = Date.now();
+      connectionsRef.current.forEach((c) => {
+        const lastSeen = lastSeenRef.current.get(c.peer) || now;
+        if (c.open && now - lastSeen > HEARTBEAT_TIMEOUT_MS) {
+          try { c.close(); } catch (_) {}
+        }
+      });
+    }, HEARTBEAT_TIMEOUT_MS / 3);
+    return () => clearInterval(monitor);
+  }, []);
+
+  // --- Tab return: re-align immediately (background throttling drifts us) ---
+  useEffect(() => {
+    const onVisibility = () => {
+      if (document.visibilityState !== 'visible' || leavingRef.current) return;
+      if (isHostRef.current) {
+        if (videoRef.current && connectionsRef.current.length > 0) {
+          broadcastRef.current(hostStateMessage());
+        }
+      } else {
+        connectionsRef.current.forEach((c) => {
+          if (c.open) { try { c.send({ type: 'REQUEST_STATE' }); } catch (_) {} }
+        });
+      }
+    };
+    document.addEventListener('visibilitychange', onVisibility);
+    return () => document.removeEventListener('visibilitychange', onVisibility);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  // --- Notify the room before the tab actually dies ---
+  useEffect(() => {
+    const onBeforeUnload = () => {
+      broadcastRef.current({ type: 'LEAVE', name: userName });
+      try { peerRef.current?.destroy(); } catch (_) {}
+    };
+    window.addEventListener('beforeunload', onBeforeUnload);
+    return () => window.removeEventListener('beforeunload', onBeforeUnload);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [userName]);
+
+  // --- Live P2P diagnostics (RTT + ICE candidate type via getStats) ---
+  useEffect(() => {
+    const sample = async () => {
+      const conn = connectionsRef.current[0];
+      const pc = conn?.peerConnection;
+      if (!pc?.getStats) return;
+      try {
+        const stats = await pc.getStats();
+        let rtt = null;
+        let iceType = null;
+        for (const s of stats.values()) {
+          if (s.type === 'candidate-pair' && s.state === 'succeeded') {
+            if (s.currentRoundTripTime != null) rtt = Math.round(s.currentRoundTripTime * 1000);
+            const local = stats.get(s.localCandidateId);
+            if (local?.candidateType) iceType = local.candidateType;
+            break;
+          }
+        }
+        setNetStats((prev) => ({
+          rtt: rtt ?? prev?.rtt ?? null,
+          iceType: iceType || prev?.iceType || null,
+          offsetMs: prev?.offsetMs ?? null
+        }));
+      } catch (_) {
+        // stats unavailable — badge simply stays hidden
+      }
+    };
+    netStatsTimerRef.current = setInterval(sample, 10000);
+    return () => clearInterval(netStatsTimerRef.current);
+  }, []);
 
   // --- Host periodic sync loop (adaptive interval) ---
   useEffect(() => {
@@ -516,17 +686,8 @@ export const Room = ({ roomId, userName, isHost, onLeave }) => {
       try {
         fast = Date.now() < fastUntilRef.current;
         if (videoRef.current && connectionsRef.current.length > 0) {
-          seqRef.current += 1;
           try {
-            broadcastRef.current({
-              type: 'SYNC',
-              url: videoUrlRef.current,
-              time: videoRef.current.currentTime,
-              playing: !videoRef.current.paused,
-              sentAt: Date.now(),
-              seq: seqRef.current,
-              duration: videoRef.current.duration || 0
-            });
+            broadcastRef.current(hostStateMessage());
           } catch (_) {
             // a dying connection must never kill the sync loop
           }
@@ -545,7 +706,7 @@ export const Room = ({ roomId, userName, isHost, onLeave }) => {
     if (isHost) return;
     const measure = () => {
       connectionsRef.current.forEach((c) => {
-        if (c.open) c.send({ type: 'PING', t0: Date.now() });
+        if (c.open) { try { c.send({ type: 'PING', t0: Date.now() }); } catch (_) {} }
       });
     };
     measure();
@@ -658,7 +819,7 @@ export const Room = ({ roomId, userName, isHost, onLeave }) => {
     // Smooth the drift with a small moving average (jitter guard)
     const sma = driftSmaRef.current;
     sma.push(drift);
-    if (sma.length > 3) sma.shift();
+    if (sma.length > DRIFT_SMA_WINDOW) sma.shift();
     const smoothDrift = sma.reduce((a, b) => a + b, 0) / sma.length;
 
     // Tell the host to tighten its broadcast while we are far off
@@ -668,6 +829,9 @@ export const Room = ({ roomId, userName, isHost, onLeave }) => {
     }
 
     const nowPlaying = !video.paused;
+    // Hard seeks are only safe once the host clock is actually measured
+    // (or the RTT is tiny) — otherwise a skewed clock causes seek spam.
+    const canHardCorrect = offsetInitRef.current || bestRttRef.current < DRIFT_REPORT_MIN_RTT;
 
     if (data.playing !== nowPlaying) {
       isSyncingRef.current = true;
@@ -676,14 +840,14 @@ export const Room = ({ roomId, userName, isHost, onLeave }) => {
         safePlay(video).then((ok) => { if (ok) setIsPlaying(true); });
       } else {
         video.pause();
-        if (Math.abs(smoothDrift) > 0.5) video.currentTime = estTime;
+        if (Math.abs(smoothDrift) > 0.5 && canHardCorrect) video.currentTime = estTime;
         setIsPlaying(false);
       }
       video.playbackRate = userSpeedRef.current;
       lastCorrectionRef.current = now;
       setTimeout(() => { isSyncingRef.current = false; }, 300);
     } else if (data.playing) {
-      if (Math.abs(smoothDrift) >= HARD_DRIFT_THRESHOLD) {
+      if (Math.abs(smoothDrift) >= HARD_DRIFT_THRESHOLD && canHardCorrect) {
         isSyncingRef.current = true;
         video.currentTime = estTime;
         video.playbackRate = userSpeedRef.current;
@@ -696,7 +860,7 @@ export const Room = ({ roomId, userName, isHost, onLeave }) => {
         video.playbackRate = userSpeedRef.current;
       }
     } else {
-      if (Math.abs(smoothDrift) > 0.5) {
+      if (Math.abs(smoothDrift) > 0.5 && canHardCorrect) {
         isSyncingRef.current = true;
         video.currentTime = estTime;
         lastCorrectionRef.current = now;
@@ -708,6 +872,7 @@ export const Room = ({ roomId, userName, isHost, onLeave }) => {
 
   const handleKicked = () => {
     if (leavingRef.current) return; // dedupe: KICK + KICKED both reach us
+    kickedRef.current = true; // never auto-reconnect after a kick
     leavingRef.current = true;
     addToast('شما توسط میزبان از اتاق حذف شدید', 'error');
     setTimeout(onLeave, 600);
@@ -764,50 +929,88 @@ export const Room = ({ roomId, userName, isHost, onLeave }) => {
   };
 
   const handlePeerData = (data, conn) => {
+    // --- Authority checks: only the host / admins may steer the room ---
+    const senderIsController = () => {
+      if (conn.peer === hostPeerId) return true;
+      const sender = participantsRef.current.find((p) => p.id === conn.peer);
+      return !!sender && (sender.isHost || sender.isAdmin);
+    };
+    const senderIsHost = () => conn.peer === hostPeerId;
+
     switch (data.type) {
       case 'JOIN_ROOM':
-        // Dedupe against the ref (not inside the updater) so StrictMode's
-        // double-invoked updaters can't duplicate the join toast.
-        if (!participantsRef.current.some((p) => p.id === conn.peer)) {
-          const isHostPeer = conn.peer === `bebinim-host-${roomId}`;
-          addToast(`${data.name} به اتاق پیوست`, 'success');
-          setParticipants((prev) =>
-            prev.some((p) => p.id === conn.peer)
-              ? prev
-              : [...prev, { id: conn.peer, name: data.name, isHost: isHostPeer, isAdmin: false }]
-          );
-        }
+        if (participantsRef.current.some((p) => p.id === conn.peer)) break;
+        const isHostPeer = conn.peer === hostPeerId;
+        setParticipants((prev) =>
+          prev.some((p) => p.id === conn.peer)
+            ? prev
+            : [...prev, { id: conn.peer, name: data.name, isHost: isHostPeer, isAdmin: false }]
+        );
+        // The host introducing itself to a guest needs no fanfare
+        if (isHostPeer) break;
+        // Host side: newcomer learns the full roster; everyone hears about them
+        addToast(`${data.name} به اتاق پیوست`, 'success');
+        try { conn.send({ type: 'ROOM_STATE', participants: participantsRef.current }); } catch (_) {}
+        broadcastRef.current({ type: 'PEER_JOINED', id: conn.peer, name: data.name }, conn.peer);
+        break;
+
+      case 'ROOM_STATE': {
+        // Host's authoritative roster (sent right after joining / reconnect).
+        // Drop our own peer entry AND the host's 'self' entry (id collision).
+        const mine = peerRef.current?.id;
+        const others = (data.participants || []).filter((p) => p.id !== mine && p.id !== 'self');
+        setParticipants((prev) => {
+          const self = prev[0];
+          return self ? [self, ...others] : prev;
+        });
+        break;
+      }
+
+      case 'PEER_JOINED':
+        setParticipants((prev) =>
+          prev.some((p) => p.id === data.id)
+            ? prev
+            : [...prev, { id: data.id, name: data.name, isHost: false, isAdmin: false }]
+        );
+        if (!leavingRef.current) addToast(`${data.name} به اتاق پیوست`, 'success');
+        break;
+
+      case 'PEER_LEFT':
+        setParticipants((prev) => prev.filter((p) => p.id !== data.id));
+        break;
+
+      case 'LEAVE':
+        setParticipants((prev) => prev.filter((p) => p.id !== conn.peer));
+        if (!leavingRef.current) addToast(`${data.name || 'کاربر'} اتاق را ترک کرد`, 'info');
+        break;
+
+      case 'HEARTBEAT':
+        try { conn.send({ type: 'HEARTBEAT_ACK' }); } catch (_) {}
+        break;
+
+      case 'HEARTBEAT_ACK':
         break;
 
       case 'REQUEST_STATE':
         if (isHost && videoRef.current) {
-          seqRef.current += 1;
-          conn.send({
-            type: 'SYNC',
-            url: videoUrlRef.current,
-            time: videoRef.current.currentTime,
-            playing: !videoRef.current.paused,
-            sentAt: Date.now(),
-            seq: seqRef.current,
-            duration: videoRef.current.duration || 0
-          });
+          conn.send(hostStateMessage());
         }
         break;
 
       case 'SYNC':
-        applySync(data);
+        if (senderIsHost()) applySync(data);
         break;
 
       case 'PLAY':
-        applySync({ ...data, playing: true, time: data.currentTime });
+        if (senderIsController()) applySync({ ...data, playing: true, time: data.currentTime });
         break;
 
       case 'PAUSE':
-        applySync({ ...data, playing: false, time: data.currentTime });
+        if (senderIsController()) applySync({ ...data, playing: false, time: data.currentTime });
         break;
 
       case 'SEEK':
-        if (videoRef.current && !isSyncingRef.current) {
+        if (senderIsController() && videoRef.current && !isSyncingRef.current) {
           const est = (data.currentTime || 0)
             + (Date.now() - (data.sentAt || Date.now()) + clockOffsetRef.current) / 1000;
           videoRef.current.currentTime = Math.min(est, videoRef.current.duration || est);
@@ -863,6 +1066,11 @@ export const Room = ({ roomId, userName, isHost, onLeave }) => {
             ? clockOffsetRef.current * 0.75 + sample * 0.25
             : sample;
           offsetInitRef.current = true;
+          setNetStats((prev) => ({
+            ...prev,
+            rtt: Math.round(rtt),
+            offsetMs: Math.round(clockOffsetRef.current)
+          }));
         }
         break;
       }
@@ -923,6 +1131,8 @@ export const Room = ({ roomId, userName, isHost, onLeave }) => {
         break;
 
       case 'CONTROL_RESULT':
+        // Only the host resolves requests
+        if (!senderIsHost()) break;
         // Close any open approval modal matching this request
         if (pendingRequestRef.current && pendingRequestRef.current.reqId === data.reqId) {
           pendingRequestRef.current = null;
@@ -943,8 +1153,12 @@ export const Room = ({ roomId, userName, isHost, onLeave }) => {
         break;
 
       case 'UPDATE_ROLE':
+        if (!senderIsHost()) break;
         setParticipants((prev) =>
-          prev.map((p) => (p.id === data.targetId ? { ...p, isAdmin: data.isAdmin } : p))
+          prev.map((p) => {
+            const isMe = p.id === 'self' && peerRef.current && data.targetId === peerRef.current.id;
+            return p.id === data.targetId || isMe ? { ...p, isAdmin: data.isAdmin } : p;
+          })
         );
         if (peerRef.current && data.targetId === peerRef.current.id) {
           setSelfIsAdmin(data.isAdmin);
@@ -952,6 +1166,7 @@ export const Room = ({ roomId, userName, isHost, onLeave }) => {
         break;
 
       case 'KICK':
+        if (!senderIsController()) break;
         setParticipants((prev) => prev.filter((p) => p.id !== data.targetId));
         if (peerRef.current && data.targetId === peerRef.current.id) {
           handleKicked();
@@ -981,12 +1196,17 @@ export const Room = ({ roomId, userName, isHost, onLeave }) => {
     // StrictMode double-mount + HMR leave this flag set from the previous
     // cleanup; reset it so "host left" handling keeps working.
     leavingRef.current = false;
+    kickedRef.current = false;
+    reconnectAttemptsRef.current = 0;
+    setReconnecting(false);
 
     const peerId = isHost
-      ? `bebinim-host-${roomId}`
+      ? hostPeerId
       : `bebinim-guest-${roomId}-${Math.random().toString(36).substring(2, 6)}`;
 
     let cancelled = false;
+    let hostIdAttempts = 0;
+
     const initPeer = async () => {
       const { default: Peer } = await import('peerjs');
 
@@ -1005,29 +1225,66 @@ export const Room = ({ roomId, userName, isHost, onLeave }) => {
       }
 
       if (cancelled) return;
-      const p = new Peer(peerId, config);
-      peerRef.current = p;
 
-      p.on('open', (id) => {
-        if (cancelled) return;
-        if (isHost) {
-          addToast(`اتاق ایجاد شد. کد اتاق: ${roomId}`, 'success');
-        } else {
-          addToast('در حال اتصال به میزبان...', 'info');
-          connectToHost(p, `bebinim-host-${roomId}`, 1);
-        }
-      });
+      // Resume the host ID after a refresh so guests can reattach to the
+      // same room (the ID may still be held by the dying socket — retried below).
+      let idToClaim = peerId;
+      if (isHost) {
+        const saved = sessionStorage.getItem(`bebinim-host-id-${roomId}`);
+        if (saved) idToClaim = saved;
+        sessionStorage.setItem(`bebinim-host-id-${roomId}`, idToClaim);
+      }
 
-      p.on('connection', (conn) => {
-        setupConnection(conn, 1);
-      });
+      const createPeer = () => {
+        if (cancelled || leavingRef.current) return null;
+        const p = new Peer(idToClaim, config);
+        peerRef.current = p;
 
-      p.on('error', (err) => {
-        console.error('Peer error:', err);
-        if (err.type !== 'peer-unavailable') {
-          addToast(`خطای اتصال P2P: ${err.type || err.message}`, 'error');
-        }
-      });
+        p.on('open', (id) => {
+          if (cancelled) return;
+          if (isHost) {
+            addToast(`اتاق ایجاد شد. کد اتاق: ${roomId}`, 'success');
+          } else {
+            addToast('در حال اتصال به میزبان...', 'info');
+            connectToHost(p, hostPeerId, 1);
+          }
+        });
+
+        p.on('connection', (conn) => {
+          setupConnection(conn, 1);
+        });
+
+        p.on('disconnected', () => {
+          // Signaling socket dropped — recover in place, keep our ID
+          if (cancelled || leavingRef.current || peerRef.current !== p) return;
+          try { p.reconnect(); } catch (_) {}
+        });
+
+        p.on('error', (err) => {
+          if (cancelled) return;
+          if (isHost && err.type === 'unavailable-id' && hostIdAttempts < MAX_HOST_ID_RETRIES) {
+            // A previous socket (e.g. a reloaded tab) may still hold the ID;
+            // destroy and re-claim after a short backoff.
+            hostIdAttempts += 1;
+            if (peerRef.current === p) peerRef.current = null;
+            try { p.destroy(); } catch (_) {}
+            setTimeout(() => {
+              if (cancelled || leavingRef.current) return;
+              addToast(`بازیابی شناسه میزبان... (${hostIdAttempts}/${MAX_HOST_ID_RETRIES})`, 'info');
+              createPeer();
+            }, HOST_ID_RETRY_DELAY_MS);
+            return;
+          }
+          console.error('Peer error:', err);
+          if (err.type !== 'peer-unavailable') {
+            addToast(`خطای اتصال P2P: ${err.type || err.message}`, 'error');
+          }
+        });
+
+        return p;
+      };
+
+      createPeer();
     };
 
     initPeer();
@@ -1036,7 +1293,11 @@ export const Room = ({ roomId, userName, isHost, onLeave }) => {
       cancelled = true;
       leavingRef.current = true;
       connectionsRef.current = [];
+      heartbeatTimersRef.current.forEach((t) => clearInterval(t));
+      heartbeatTimersRef.current.clear();
+      clearTimeout(reconnectTimerRef.current);
       clearInterval(bufferTimerRef.current);
+      clearInterval(netStatsTimerRef.current);
       if (peerRef.current) {
         try { peerRef.current.destroy(); } catch (_) {}
         peerRef.current = null;
@@ -1045,30 +1306,35 @@ export const Room = ({ roomId, userName, isHost, onLeave }) => {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [roomId]);
 
-  const connectToHost = (pInstance, hostPeerId, attempt) => {
-    const conn = pInstance.connect(hostPeerId, { reliable: true });
+  const connectToHost = (pInstance, hostId, attempt) => {
+    const conn = pInstance.connect(hostId, { reliable: true, serialization: 'json' });
     setupConnection(conn, attempt);
   };
 
   const setupConnection = (conn, attempt = 1) => {
     let settled = false;
+    lastSeenRef.current.set(conn.peer, Date.now());
 
     conn.on('error', (err) => {
-      if (settled) return;
+      if (settled) {
+        // Post-open failure: let the close / zombie-monitor path clean up
+        try { conn.close(); } catch (_) {}
+        return;
+      }
       if (err.type === 'peer-unavailable' && attempt < MAX_CONNECT_RETRIES) {
         settled = true;
         addToast(`میزبان هنوز آنلاین نیست، تلاش مجدد (${attempt}/${MAX_CONNECT_RETRIES - 1})...`, 'info');
         setTimeout(() => {
           // Never touch a destroyed peer (e.g. retry timer firing after unmount)
           if (leavingRef.current || !peerRef.current) return;
-          const retry = peerRef.current.connect(`bebinim-host-${roomId}`, { reliable: true });
+          const retry = peerRef.current.connect(hostPeerId, { reliable: true, serialization: 'json' });
           setupConnection(retry, attempt + 1);
         }, RETRY_DELAY_MS);
       } else if (!settled) {
         settled = true;
         addToast(`خطای اتصال: ${err.type || err.message}`, 'error');
         // The host never came online — don't leave guests stranded forever
-        if (!isHostRef.current) {
+        if (!isHostRef.current && !kickedRef.current) {
           setTimeout(() => {
             if (!leavingRef.current) onLeave();
           }, 2500);
@@ -1078,52 +1344,58 @@ export const Room = ({ roomId, userName, isHost, onLeave }) => {
 
     conn.on('open', () => {
       settled = true;
+      reconnectAttemptsRef.current = 0;
+      setReconnecting(false);
+      lastSeenRef.current.set(conn.peer, Date.now());
       const exists = connectionsRef.current.some((c) => c.peer === conn.peer);
       if (!exists) {
         connectionsRef.current = [...connectionsRef.current, conn];
         setConnections((prev) => (prev.some((c) => c.peer === conn.peer) ? prev : [...prev, conn]));
       }
 
-      conn.send({
-        type: 'JOIN_ROOM',
-        name: userName,
-        isHost: isHostRef.current,
-        isAdmin: selfIsAdminRef.current
-      });
+      try {
+        conn.send({
+          type: 'JOIN_ROOM',
+          name: userName,
+          isHost: isHostRef.current,
+          isAdmin: selfIsAdminRef.current
+        });
+      } catch (_) {}
 
       if (isHost) {
         if (videoRef.current) {
-          seqRef.current += 1;
-          conn.send({
-            type: 'SYNC',
-            url: videoUrlRef.current,
-            time: videoRef.current.currentTime,
-            playing: !videoRef.current.paused,
-            sentAt: Date.now(),
-            seq: seqRef.current,
-            duration: videoRef.current.duration || 0
-          });
+          try { conn.send(hostStateMessage()); } catch (_) {}
         }
       } else {
-        setTimeout(() => conn.send({ type: 'REQUEST_STATE' }), 300);
+        setTimeout(() => {
+          if (conn.open) { try { conn.send({ type: 'REQUEST_STATE' }); } catch (_) {} }
+        }, 300);
       }
+
+      startHeartbeat(conn);
     });
 
     conn.on('data', (data) => {
+      lastSeenRef.current.set(conn.peer, Date.now());
       handlePeerData(data, conn);
     });
 
     conn.on('close', () => {
+      stopHeartbeat(conn.peer);
+      lastSeenRef.current.delete(conn.peer);
+      const wasListed = connectionsRef.current.some((c) => c.peer === conn.peer);
       connectionsRef.current = connectionsRef.current.filter((c) => c.peer !== conn.peer);
       setConnections((prev) => prev.filter((c) => c.peer !== conn.peer));
       setParticipants((prev) => prev.filter((p) => p.id !== conn.peer));
+      if (isHostRef.current && wasListed && !leavingRef.current) {
+        // Guests only ever hear the host: relay removals to the whole room
+        broadcastRef.current({ type: 'PEER_LEFT', id: conn.peer });
+      }
       if (!leavingRef.current) {
-        if (!isHost && conn.peer === `bebinim-host-${roomId}`) {
-          // The host left -> the room no longer exists for us
-          leavingRef.current = true;
-          addToast('میزبان اتاق را ترک کرد. شما به صفحه اصلی بازگردانده شدید', 'error');
-          setTimeout(onLeave, 700);
-        } else {
+        if (!isHostRef.current && conn.peer === hostPeerId && !kickedRef.current) {
+          // Host link dropped — attempt to reattach before giving up
+          startReconnect();
+        } else if (wasListed && !isHostRef.current) {
           addToast('یکی از کاربران اتاق را ترک کرد', 'info');
         }
       }
@@ -1165,6 +1437,7 @@ export const Room = ({ roomId, userName, isHost, onLeave }) => {
           currentTime: v.currentTime,
           sentAt: Date.now()
         });
+        if (isHostRef.current) fastUntilRef.current = Date.now() + FAST_AFTER_EVENT_MS;
       });
     } else {
       v.pause();
@@ -1174,6 +1447,7 @@ export const Room = ({ roomId, userName, isHost, onLeave }) => {
         currentTime: v.currentTime,
         sentAt: Date.now()
       });
+      if (isHostRef.current) fastUntilRef.current = Date.now() + FAST_AFTER_EVENT_MS;
     }
   }, [isBuffering, bufferCountdown, addToast]);
 
@@ -1199,6 +1473,7 @@ export const Room = ({ roomId, userName, isHost, onLeave }) => {
       // the data channel with dozens of SEEK packets per second.
       if (!isSyncingRef.current) {
         broadcastRef.current({ type: 'SEEK', currentTime: newTime, sentAt: Date.now() });
+        if (isHostRef.current) fastUntilRef.current = Date.now() + FAST_AFTER_EVENT_MS;
       }
     } else {
       requestControl('seek', newTime);
@@ -1217,6 +1492,7 @@ export const Room = ({ roomId, userName, isHost, onLeave }) => {
     v.currentTime = target;
     if (!isSyncingRef.current) {
       broadcastRef.current({ type: 'SEEK', currentTime: target, sentAt: Date.now() });
+      if (isHostRef.current) fastUntilRef.current = Date.now() + FAST_AFTER_EVENT_MS;
     }
   }, [requestControl]);
 
@@ -1439,21 +1715,12 @@ export const Room = ({ roomId, userName, isHost, onLeave }) => {
   // --- Manual re-sync (no page reload: everyone aligns to the host again) ---
   const syncNow = () => {
     if (isHost) {
-      if (videoRef.current) {
-        seqRef.current += 1;
-        broadcastRef.current({
-          type: 'SYNC',
-          url: videoUrlRef.current,
-          time: videoRef.current.currentTime,
-          playing: !videoRef.current.paused,
-          sentAt: Date.now(),
-          seq: seqRef.current,
-          duration: videoRef.current.duration || 0
-        });
+      if (videoRef.current && connectionsRef.current.length > 0) {
+        broadcastRef.current(hostStateMessage());
       }
     } else {
       connectionsRef.current.forEach((c) => {
-        if (c.open) c.send({ type: 'REQUEST_STATE' });
+        if (c.open) { try { c.send({ type: 'REQUEST_STATE' }); } catch (_) {} }
       });
     }
     addToast('همگام‌سازی مجدد انجام شد', 'success');
@@ -1647,11 +1914,21 @@ export const Room = ({ roomId, userName, isHost, onLeave }) => {
     addToast(`کاربر ${target?.name || ''} از اتاق حذف شد`, 'success');
   };
 
-  const syncStatus = connections.length > 0
-    ? `همگام‌سازی زنده P2P (${connections.length} اتصال)`
-    : isHost
-      ? 'در انتظار مهمان‌ها...'
-      : 'در حال برقراری اتصال P2P...';
+  const syncStatus = reconnecting
+    ? 'در حال اتصال مجدد...'
+    : connections.length > 0
+      ? `همگام‌سازی زنده P2P (${connections.length} اتصال)`
+      : isHost
+        ? 'در انتظار مهمان‌ها...'
+        : 'در حال برقراری اتصال P2P...';
+
+  const iceTypeLabel = netStats?.iceType === 'relay'
+    ? 'رله (TURN)'
+    : netStats?.iceType === 'srflx'
+      ? 'مستقیم (P2P)'
+      : netStats?.iceType === 'host'
+        ? 'مستقیم (LAN)'
+        : '—';
 
   const signalingHost = ACTIVE_SIGNALING.includes('://')
     ? new URL(ACTIVE_SIGNALING).host
@@ -1915,6 +2192,11 @@ export const Room = ({ roomId, userName, isHost, onLeave }) => {
                     {connections.length > 0 ? <Radio className="w-3 h-3 md:w-3.5 md:h-3.5 text-red-400" /> : <Wifi className="w-3 h-3 md:w-3.5 md:h-3.5 text-amber-400" />}
                     {syncStatus}
                   </span>
+                  {netStats?.rtt != null && connections.length > 0 && (
+                    <span className="text-[9px] md:text-[10px] px-1.5 py-0.5 rounded-md bg-black/50 border border-white/10 text-emerald-400 font-mono whitespace-nowrap" dir="ltr" title={`تاخیر: ${netStats.rtt}ms${netStats.offsetMs != null ? ` · اختلاف ساعت: ${netStats.offsetMs}ms` : ''}`}>
+                      {netStats.rtt}ms
+                    </span>
+                  )}
                 </div>
                 <div className="flex items-center gap-2">
                   {isFullscreen && (
@@ -2654,6 +2936,24 @@ export const Room = ({ roomId, userName, isHost, onLeave }) => {
                   : xirsysTurnActive
                     ? 'xirsys (خودکار)'
                     : 'خاموش (فقط P2P)'}
+              </span>
+            </div>
+            <div className="flex items-center justify-between">
+              <span>rtt (تاخیر)</span>
+              <span className={netStats?.rtt != null ? 'text-emerald-400' : 'text-gray-500'}>
+                {netStats?.rtt != null ? `${netStats.rtt}ms` : '—'}
+              </span>
+            </div>
+            <div className="flex items-center justify-between">
+              <span>clock offset (اختلاف ساعت)</span>
+              <span className={netStats?.offsetMs != null ? 'text-emerald-400' : 'text-gray-500'}>
+                {netStats?.offsetMs != null ? `${netStats.offsetMs}ms` : '—'}
+              </span>
+            </div>
+            <div className="flex items-center justify-between">
+              <span>مسیر اتصال</span>
+              <span className={netStats?.iceType ? 'text-emerald-400' : 'text-gray-500'}>
+                {iceTypeLabel}
               </span>
             </div>
           </div>
