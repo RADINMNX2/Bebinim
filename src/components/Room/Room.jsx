@@ -8,6 +8,7 @@ import {
 import { useToast } from '../../context/ToastContext';
 import { Modal } from '../UI/Modal';
 import { AnimatedInput } from '../UI/AnimatedInput';
+import { Select } from '../UI/Select';
 import { extractMkvSubtitles, cuesToSrt } from '../../utils/mkvSubtitles';
 
 // Default free STUN servers to maximize NAT traversal success inside Iran
@@ -134,6 +135,15 @@ const RETRY_DELAY_MS = 2500;
 const CHAT_WINDOW = 60;
 const SKIP_SECONDS = 10;
 const SPEEDS = [0.5, 0.75, 1, 1.25, 1.5, 2];
+
+// Subtitle font options for the modern Select (family applied via CSS)
+const SUBTITLE_FONTS = [
+  { value: 'inherit', label: 'پیش‌فرض' },
+  { value: "'Vazirmatn', sans-serif", label: 'وزیرمتن' },
+  { value: "'Inter', sans-serif", label: 'Inter' },
+  { value: 'Tahoma', label: 'Tahoma' },
+  { value: 'Arial', label: 'Arial' },
+];
 
 const ACTION_LABELS = {
   toggle: 'پخش / توقف',
@@ -2557,6 +2567,20 @@ export const Room = ({ roomId, userName, isHost, onLeave }) => {
                         <Plus className="w-5 h-5" />
                       </button>
                     </div>
+                  </div>
+
+                  {/* Subtitle Font */}
+                  <div className="glass-card p-4 rounded-xl">
+                    <div className="flex items-center gap-2 mb-3">
+                      <Type className="w-5 h-5 text-purple-400" />
+                      <span className="font-medium text-white">فونت زیرنویس</span>
+                    </div>
+                    <Select
+                      value={subtitleSettings.fontFamily}
+                      onChange={(v) => setSubtitleSettings((s) => ({ ...s, fontFamily: v }))}
+                      options={SUBTITLE_FONTS}
+                      label="فونت"
+                    />
                   </div>
 
                   {/* Font Color */}

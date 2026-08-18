@@ -214,6 +214,116 @@ body {
   100% { background-position: -130% 0; }
 }
 
+/* ============ Modern Neon Select (Select) ============ */
+
+.modern-select {
+  position: relative;
+  display: block;
+  border-radius: 0.875rem;
+  background: linear-gradient(180deg, rgba(9, 9, 11, 0.85), rgba(0, 0, 0, 0.6));
+  border: 1px solid rgba(255, 255, 255, 0.12);
+  box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.05), 0 4px 16px rgba(0, 0, 0, 0.35);
+  transition: border-color 0.25s ease, box-shadow 0.25s ease;
+}
+
+.modern-select:focus-within {
+  border-color: rgba(239, 68, 68, 0.7);
+  box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.05),
+    0 0 0 3px rgba(239, 68, 68, 0.18),
+    0 0 28px rgba(239, 68, 68, 0.18);
+}
+
+.ms-trigger {
+  width: 100%;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.75rem;
+  padding: 0.75rem 1rem;
+  background: transparent;
+  border: 0;
+  outline: 0;
+  color: #ffffff;
+  font-size: 0.875rem;
+  font-weight: 600;
+  cursor: pointer;
+  border-radius: inherit;
+}
+
+.ms-value {
+  min-width: 0;
+  overflow: hidden;
+  white-space: nowrap;
+  text-overflow: ellipsis;
+}
+
+.ms-label {
+  color: #71717a;
+  font-weight: 400;
+}
+
+.ms-value-empty {
+  color: #52525b;
+  font-weight: 400;
+}
+
+.ms-arrow {
+  flex-shrink: 0;
+  width: 1rem;
+  height: 1rem;
+  color: #ef4444;
+  transition: transform 0.25s ease;
+}
+
+.ms-arrow-open {
+  transform: rotate(180deg);
+}
+
+.ms-menu {
+  position: absolute;
+  top: calc(100% + 0.5rem);
+  right: 0;
+  left: 0;
+  z-index: 60;
+  margin: 0;
+  padding: 0.375rem;
+  list-style: none;
+  max-height: 220px;
+  overflow-y: auto;
+  background: #0f0f12;
+  border: 1px solid rgba(239, 68, 68, 0.35);
+  border-radius: 0.875rem;
+  box-shadow: 0 14px 44px rgba(0, 0, 0, 0.75), 0 0 24px rgba(239, 68, 68, 0.12);
+  animation: slideUp 0.22s ease-out;
+}
+
+.ms-option {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.5rem;
+  padding: 0.55rem 0.875rem;
+  border-radius: 0.6rem;
+  font-size: 0.85rem;
+  color: #d4d4d8;
+  cursor: pointer;
+  opacity: 0;
+  animation: fadeIn 0.3s cubic-bezier(0.16, 1, 0.3, 1) forwards;
+  transition: background-color 0.15s ease, color 0.15s ease;
+}
+
+.ms-option:hover,
+.ms-option-active {
+  background: rgba(239, 68, 68, 0.12);
+  color: #ffffff;
+}
+
+.ms-option-selected {
+  color: #f87171;
+  font-weight: 700;
+  background: rgba(239, 68, 68, 0.08);
+}
+
 /* Native input + text overlay share one grid cell (stacked in-flow), so the
    box height comes from the content and the whole box is clickable */
 .mi-native {
@@ -254,29 +364,22 @@ body {
   color: #52525b;
 }
 
-/* Directionally consistent run: atomic box so outer bidi can't reorder it,
-   while its chars keep flowing in the run's own direction */
-.mi-seg {
-  display: inline-block;
-  unicode-bidi: isolate;
-}
-
-/* Per-character pop-in: new letters cascade in left-to-right */
+/* Per-character pop-in: new letters cascade in as they are typed.
+   display: inline (never inline-block!) keeps the browser's native text
+   shaping intact — atomic boxes break bidi AND Persian/Arabic joining.
+   Animation uses opacity/filter only: transforms don't apply to inline */
 .mi-char {
-  display: inline-block;
+  display: inline;
   animation: charIn 0.24s cubic-bezier(0.22, 1, 0.36, 1) backwards;
-  will-change: transform, opacity;
 }
 
 @keyframes charIn {
   from {
     opacity: 0;
-    transform: translateY(0.4em) scale(0.5);
-    filter: blur(4px);
+    filter: blur(3px);
   }
   to {
     opacity: 1;
-    transform: translateY(0) scale(1);
     filter: blur(0);
   }
 }
