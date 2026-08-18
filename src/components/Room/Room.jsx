@@ -1585,39 +1585,6 @@ export const Room = ({ roomId, userName, isHost, onLeave }) => {
     }
   }, [volume, isMuted]);
 
-  // Keyboard shortcuts: Space/K play/pause · ←/→ skip · ↑/↓ volume · M mute · F fullscreen
-  // Uses physical key codes (e.code) so they work on Persian keyboard layouts too.
-  useEffect(() => {
-    const onKeyDown = (e) => {
-      const t = e.target;
-      if (t && (t.closest('input, textarea, select, [contenteditable]') || t.tagName === 'BUTTON')) return;
-      if (!videoUrlRef.current || document.querySelector('[role="dialog"]')) return;
-      const code = e.code;
-      if (code === 'Space' && e.repeat) return;
-      if (code === 'Space' || code === 'KeyK') {
-        e.preventDefault();
-        togglePlay();
-      } else if (code === 'ArrowLeft') {
-        e.preventDefault();
-        skipBy(-SKIP_SECONDS);
-      } else if (code === 'ArrowRight') {
-        e.preventDefault();
-        skipBy(SKIP_SECONDS);
-      } else if (code === 'ArrowUp' || code === 'ArrowDown') {
-        e.preventDefault();
-        const cur = videoRef.current?.volume ?? volume;
-        const step = code === 'ArrowUp' ? 0.1 : -0.1;
-        handleVolumeChange(Math.min(1, Math.max(0, Math.round((cur + step) * 100) / 100)));
-      } else if (code === 'KeyM') {
-        toggleMute();
-      } else if (code === 'KeyF') {
-        toggleFullscreen();
-      }
-    };
-    window.addEventListener('keydown', onKeyDown);
-    return () => window.removeEventListener('keydown', onKeyDown);
-  }, [togglePlay, skipBy, handleVolumeChange, toggleMute, toggleFullscreen, volume]);
-
   // Activity listeners keep controls visible; reactions (z-20) stay above and don't block
   useEffect(() => {
     const el = playerWrapRef.current;
@@ -1922,8 +1889,13 @@ export const Room = ({ roomId, userName, isHost, onLeave }) => {
     if (modalOpenRef.current) return; // never fire behind an open modal
     if (e.target.tagName === 'INPUT' || e.target.tagName === 'TEXTAREA' || e.target.isContentEditable) return;
     if (e.target.closest('button')) return; // let focused buttons handle their own activation
-    switch (e.key) {
+    if (e.repeat && e.code === 'Space') return;
+    // Physical key codes (e.code) so shortcuts work on Persian keyboard layouts too
+    const key = e.code || e.key;
+    switch (key) {
       case ' ':
+      case 'Space':
+      case 'KeyK':
         e.preventDefault();
         togglePlay();
         break;
@@ -1933,15 +1905,25 @@ export const Room = ({ roomId, userName, isHost, onLeave }) => {
       case 'ArrowLeft':
         skipBy(-(e.shiftKey ? 60 : SKIP_SECONDS));
         break;
+      case 'ArrowUp':
+      case 'ArrowDown':
+        e.preventDefault();
+        handleVolumeChange(
+          Math.min(1, Math.max(0, Math.round(((videoRef.current?.volume ?? 1) + (key === 'ArrowUp' ? 0.1 : -0.1)) * 100) / 100))
+        );
+        break;
+      case 'KeyF':
       case 'f':
       case 'F':
         if (canControlRef.current) enterFullscreen();
         else requestControl('fullscreen');
         break;
+      case 'KeyM':
       case 'm':
       case 'M':
         toggleMute();
         break;
+      case 'KeyC':
       case 'c':
       case 'C':
         if (subtitleCues.length > 0) setSubtitleEnabled((s) => !s);
