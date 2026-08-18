@@ -4,11 +4,11 @@ import {
   Play, Pause, Volume2, VolumeX, Maximize, Minimize, Share2, Users, MessageSquare,
   Send, Link as LinkIcon, Film, LogOut, Check, Radio, Wifi, RefreshCw,
   Crown, Shield, ShieldOff, UserX, Settings, Loader2, Rewind, FastForward,
-  Subtitles, PictureInPicture, Languages, X, SlidersHorizontal, Palette, Type, Minus, Plus
+  Subtitles, PictureInPicture, Languages, X, SlidersHorizontal, Palette, Type, Minus, Plus, WifiOff
 } from 'lucide-react';
 import { useToast } from '../../context/ToastContext';
 import { Modal } from '../UI/Modal';
-import { extractMkvSubtitles } from '../../utils/mkvSubtitles';
+import { extractMkvSubtitles, cuesToSrt } from '../../utils/mkvSubtitles';
 
 // Default free STUN servers to maximize NAT traversal success inside Iran
 const DEFAULT_STUN_SERVERS = [
@@ -72,7 +72,7 @@ const buildPeerConfig = () => {
     port: 443,
     secure: true,
     config: { iceServers },
-    debug: 1
+    debug: 0
   };
 
   const sigParam = getUrlParams().get('sig');
@@ -126,19 +126,33 @@ const ACTION_LABELS = {
 
 // --- SRT / WebVTT parser (modern subtitles: SRT + VTT) ---
 const parseSubtitles = (text) => {
-  const blocks = text.split(/\r?\n\r?\n/);
   const cues = [];
-  const timeRe = /(\d{1,2}):(\d{2}):(\d{2})[,.](\d{1,3})\s*-->\s*(\d{1,2}):(\d{2}):(\d{2})[,.](\d{1,3})/;
-  for (const block of blocks) {
-    const m = block.match(timeRe);
-    if (!m) continue;
-    const frac = (v) => v.padEnd(3, '0');
-    const start = +m[1] * 3600 + +m[2] * 60 + +m[3] + +frac(m[4]) / 1000;
-    const end = +m[5] * 3600 + +m[6] * 60 + +m[7] + +frac(m[8]) / 1000;
-    const text = block.replace(timeRe, '').replace(/<[^>]+>/g, '').trim();
-    if (text) cues.push({ start, end, text });
+  // Optional hours, optional trailing WebVTT cue settings
+  const timeRe = /^(?:(\d{1,2}):)?(\d{2}):(\d{2})[,.](\d{1,3})\s*-->\s*(?:(\d{1,2}):)?(\d{2}):(\d{2})[,.](\d{1,3})/;
+  const frac = (v) => v.padEnd(3, '0');
+  for (const block of text.split(/\r?\n\r?\n/)) {
+    const lines = block.split(/\r?\n/);
+    const idx = lines.findIndex((l) => timeRe.test(l.trim()));
+    if (idx === -1) continue;
+    const m = timeRe.exec(lines[idx].trim());
+    const start = +(m[1] || 0) * 3600 + +m[2] * 60 + +m[3] + +frac(m[4]) / 1000;
+    const end = +(m[5] || 0) * 3600 + +m[6] * 60 + +m[7] + +frac(m[8]) / 1000;
+    const textLines = lines
+      .filter((_, i) => i !== idx)
+      .map((l) => l.replace(/<[^>]+>/g, '').trim());
+    while (textLines.length && /^\d+$/.test(textLines[0])) textLines.shift(); // SRT index line
+    const cueText = textLines.join('\n').trim();
+    if (cueText && start < end) cues.push({ start, end, text: cueText });
   }
   return cues.sort((a, b) => a.start - b.start);
+};
+
+const hexToRgba = (hex, alpha) => {
+  let h = String(hex || '#000000').replace('#', '');
+  if (h.length === 3) h = h.split('').map((c) => c + c).join('');
+  const n = parseInt(h, 16);
+  if (!Number.isFinite(n)) return `rgba(0, 0, 0, ${alpha})`;
+  return `rgba(${(n >> 16) & 255}, ${(n >> 8) & 255}, ${n & 255}, ${alpha})`;
 };
 
 const fmtTime = (sec) => {
@@ -166,6 +180,7 @@ export const Room = ({ roomId, userName, isHost, onLeave }) => {
   const [bufferCountdown, setBufferCountdown] = useState(0);
   const [isFullscreen, setIsFullscreen] = useState(false);
   const [codecError, setCodecError] = useState(false);
+  const [videoError, setVideoError] = useState('');
   const [speed, setSpeed] = useState(1);
   const [speedMenuOpen, setSpeedMenuOpen] = useState(false);
 
@@ -185,7 +200,7 @@ export const Room = ({ roomId, userName, isHost, onLeave }) => {
   const [subtitleSettings, setSubtitleSettings] = useState({
     fontSize: 20,
     fontColor: '#ffffff',
-    backgroundColor: 'rgba(0, 0, 0, 0.7)',
+    backgroundColor: '#000000',
     backgroundBlur: 4,
     verticalOffset: 24, // bottom offset in px
     fontFamily: 'inherit',
@@ -245,6 +260,10 @@ export const Room = ({ roomId, userName, isHost, onLeave }) => {
   isFullscreenRef.current = isFullscreen;
   const chatOpenRef = useRef(false);
   chatOpenRef.current = chatOpen;
+  const chatModalOpenRef = useRef(false);
+  chatModalOpenRef.current = chatModalOpen;
+  const modalOpenRef = useRef(false);
+  modalOpenRef.current = requestModalOpen || isUrlModalOpen || isShareModalOpen || manageModalOpen || subtitleModalOpen || chatModalOpen;
 
   // Sync internals (upgraded engine)
   const clockOffsetRef = useRef(0);
@@ -283,7 +302,7 @@ export const Room = ({ roomId, userName, isHost, onLeave }) => {
     setControlsVisible(true);
     clearTimeout(hideTimerRef.current);
     hideTimerRef.current = setTimeout(() => {
-      if (!videoRef.current?.paused && !chatOpenRef.current) {
+      if (!videoRef.current?.paused && !chatModalOpenRef.current) {
         setControlsVisible(false);
       }
     }, 3000);
@@ -387,6 +406,17 @@ export const Room = ({ roomId, userName, isHost, onLeave }) => {
   };
 
   // --- Latency-compensated sync application (upgraded) ---
+  const resetSubtitles = () => {
+    activeSubtitleRef.current = '';
+    subtitleSourceRef.current = '';
+    setSubtitleCues([]);
+    setSubtitleName('');
+    setSubtitleText('');
+    setSubtitleEnabled(false);
+    setMkvTracks([]);
+    setMkvError('');
+  };
+
   const applySync = (data) => {
     const video = videoRef.current;
     if (!video) return;
@@ -405,6 +435,10 @@ export const Room = ({ roomId, userName, isHost, onLeave }) => {
       pendingPlayRef.current = !!data.playing;
       videoUrlRef.current = data.url;
       setVideoUrl(data.url);
+      setDuration(0);
+      setBuffered(0);
+      setCodecError(false);
+      resetSubtitles();
       startBuffering(data.readyAt || now + BUFFER_SECONDS * 1000);
       return;
     }
@@ -487,7 +521,9 @@ export const Room = ({ roomId, userName, isHost, onLeave }) => {
     if (req.action === 'toggle') {
       togglePlayInternal();
     } else if (req.action === 'seek') {
-      const target = Math.min(req.value || 0, v.duration || req.value || 0);
+      const requested = Number(req.value);
+      const target = Number.isFinite(requested) ? Math.min(requested, v.duration || requested) : v.currentTime;
+      if (!Number.isFinite(target)) return;
       v.currentTime = target;
       broadcastRef.current({ type: 'SEEK', currentTime: target, sentAt: Date.now() });
     }
@@ -522,6 +558,7 @@ export const Room = ({ roomId, userName, isHost, onLeave }) => {
 
   const requestControl = (action, value) => {
     if (sendingReqRef.current) return;
+    if (action === 'seek' && !Number.isFinite(Number(value))) return;
     sendingReqRef.current = true;
     setTimeout(() => { sendingReqRef.current = false; }, 1200);
     const reqId = `${Date.now()}-${Math.random().toString(36).slice(2, 6)}`;
@@ -585,15 +622,22 @@ export const Room = ({ roomId, userName, isHost, onLeave }) => {
       case 'CHANGE_VIDEO':
         if (data.url && data.url !== videoUrlRef.current) {
           pendingSeekRef.current = 0;
+          pendingPlayRef.current = data.playing !== false;
           videoUrlRef.current = data.url;
           setVideoUrl(data.url);
+          setDuration(0);
+          setBuffered(0);
+          setCodecError(false);
+          resetSubtitles();
           startBuffering(data.readyAt || Date.now() + BUFFER_SECONDS * 1000);
         }
         addToast(`ویدیو در حال بارگذاری: ${data.title || 'ویدیو جدید'}`, 'info');
         break;
 
       case 'CHAT_MESSAGE':
-        setMessages((prev) => [...prev, { sender: data.sender, text: data.text, time: data.time }]);
+        setMessages((prev) =>
+          [...prev, { id: data.id || `${Date.now()}-${Math.random()}`, sender: data.sender, text: data.text, time: data.time }].slice(-500)
+        );
         // Auto-open the chat modal in fullscreen, else bump the unread badge
         if (isFullscreenRef.current) {
           setChatModalOpen(true);
@@ -712,6 +756,15 @@ export const Room = ({ roomId, userName, isHost, onLeave }) => {
         setParticipants((prev) => prev.filter((p) => p.id !== data.targetId));
         if (peerRef.current && data.targetId === peerRef.current.id) {
           handleKicked();
+        } else if (isHostRef.current) {
+          // Host enforces the kick: sever the target's data channel so the
+          // removal is real even when an admin initiated it.
+          const tconn = connectionsRef.current.find((c) => c.peer === data.targetId);
+          if (tconn) {
+            try { tconn.send({ type: 'KICKED' }); } catch (_) {}
+            setTimeout(() => { try { tconn.close(); } catch (_) {} }, 200);
+            connectionsRef.current = connectionsRef.current.filter((c) => c.peer !== data.targetId);
+          }
         }
         break;
 
@@ -750,7 +803,6 @@ export const Room = ({ roomId, userName, isHost, onLeave }) => {
       peerRef.current = p;
 
       p.on('open', (id) => {
-        console.log('Peer connected with ID:', id);
         if (isHost) {
           addToast(`اتاق ایجاد شد. کد اتاق: ${roomId}`, 'success');
         } else {
@@ -850,7 +902,14 @@ export const Room = ({ roomId, userName, isHost, onLeave }) => {
       setConnections((prev) => prev.filter((c) => c.peer !== conn.peer));
       setParticipants((prev) => prev.filter((p) => p.id !== conn.peer));
       if (!leavingRef.current) {
-        addToast('یکی از کاربران اتاق را ترک کرد', 'info');
+        if (!isHost && conn.peer === `bebinim-host-${roomId}`) {
+          // The host left -> the room no longer exists for us
+          leavingRef.current = true;
+          addToast('میزبان اتاق را ترک کرد. شما به صفحه اصلی بازگردانده شدید', 'error');
+          setTimeout(onLeave, 700);
+        } else {
+          addToast('یکی از کاربران اتاق را ترک کرد', 'info');
+        }
       }
     });
   };
@@ -897,27 +956,31 @@ export const Room = ({ roomId, userName, isHost, onLeave }) => {
 
   const handleSeek = (e) => {
     const newTime = parseFloat(e.target.value);
+    if (!Number.isFinite(newTime)) return;
     setCurrentTime(newTime);
     if (!canControlRef.current || isBuffering) return;
     if (videoRef.current) videoRef.current.currentTime = newTime;
-    if (!isSyncingRef.current) {
-      broadcastRef.current({
-        type: 'SEEK',
-        currentTime: newTime,
-        sentAt: Date.now()
-      });
-    }
   };
 
   const handleSeekRelease = (e) => {
-    if (canControlRef.current || isBuffering) return;
-    requestControl('seek', parseFloat(e.target.value));
+    const newTime = parseFloat(e.target.value);
+    if (isBuffering || !Number.isFinite(newTime)) return;
+    if (canControlRef.current) {
+      // Broadcast once per drag (not per onChange event) to avoid flooding
+      // the data channel with dozens of SEEK packets per second.
+      if (!isSyncingRef.current) {
+        broadcastRef.current({ type: 'SEEK', currentTime: newTime, sentAt: Date.now() });
+      }
+    } else {
+      requestControl('seek', newTime);
+    }
   };
 
   const skipBy = (delta) => {
     const v = videoRef.current;
-    if (!v) return;
+    if (!v || !Number.isFinite(v.currentTime)) return;
     const target = Math.min(v.duration || 0, Math.max(0, v.currentTime + delta));
+    if (!Number.isFinite(target)) return;
     setCurrentTime(target);
     if (!canControlRef.current) {
       requestControl('seek', target);
@@ -934,6 +997,9 @@ export const Room = ({ roomId, userName, isHost, onLeave }) => {
     videoUrlRef.current = url;
     setVideoUrl(url);
     setCodecError(false);
+    setDuration(0);
+    setBuffered(0);
+    resetSubtitles();
     setIsUrlModalOpen(false);
     if (/\.(mkv|mks|hevc|h265|265)$/i.test(url)) {
       addToast('MKV/H.265: در صورت پشتیبانی نشدن توسط مرورگر، از دکمه دانلود استفاده کنید', 'info');
@@ -944,7 +1010,8 @@ export const Room = ({ roomId, userName, isHost, onLeave }) => {
       type: 'CHANGE_VIDEO',
       url,
       title,
-      readyAt
+      readyAt,
+      playing: !videoRef.current?.paused
     });
     addToast(`ویدیو در حال بارگذاری (${BUFFER_SECONDS} ثانیه)...`, 'info');
   };
@@ -991,11 +1058,15 @@ export const Room = ({ roomId, userName, isHost, onLeave }) => {
   }, [messages, chatModalOpen]);
 
   const enterFullscreen = () => {
-    if (!playerWrapRef.current) return;
+    const el = playerWrapRef.current;
+    if (!el) return;
     if (document.fullscreenElement) {
-      document.exitFullscreen().catch(() => {});
-    } else {
-      playerWrapRef.current.requestFullscreen?.().catch(() => {});
+      document.exitFullscreen?.().catch(() => {});
+    } else if (el.requestFullscreen) {
+      el.requestFullscreen?.().catch(() => {});
+    } else if (el.webkitRequestFullscreen) {
+      // iOS Safari
+      el.webkitRequestFullscreen?.();
     }
   };
 
@@ -1008,10 +1079,20 @@ export const Room = ({ roomId, userName, isHost, onLeave }) => {
     }
   };
 
+  const retryVideo = () => {
+    setVideoError('');
+    const v = videoRef.current;
+    if (v) {
+      v.load();
+      safePlay(v).catch(() => {});
+    }
+  };
+
   // --- Subtitles ---
   const loadSubtitleText = (text, name) => {
     const cues = parseSubtitles(text);
     subtitleSourceRef.current = text;
+    activeSubtitleRef.current = '';
     setSubtitleCues(cues);
     setSubtitleName(name);
     setSubtitleEnabled(cues.length > 0);
@@ -1024,6 +1105,8 @@ export const Room = ({ roomId, userName, isHost, onLeave }) => {
 
   // Load raw parsed cues (e.g. extracted from an MKV) directly
   const loadSubtitleCues = (cues, name) => {
+    subtitleSourceRef.current = cuesToSrt(cues);
+    activeSubtitleRef.current = '';
     setSubtitleCues(cues);
     setSubtitleName(name);
     setSubtitleEnabled(cues.length > 0);
@@ -1037,6 +1120,7 @@ export const Room = ({ roomId, userName, isHost, onLeave }) => {
   const loadSubtitleUrl = async (url) => {
     try {
       const res = await fetch(url);
+      if (!res.ok) throw new Error(`HTTP ${res.status}`);
       const text = await res.text();
       loadSubtitleText(text, url.split('/').pop().split('?')[0] || 'زیرنویس');
     } catch {
@@ -1051,7 +1135,7 @@ export const Room = ({ roomId, userName, isHost, onLeave }) => {
     reader.readAsText(file);
   };
 
-  // Cue tracking loop (rAF: smooth, no jank)
+  // Cue tracking loop (rAF + binary search: smooth, no jank, no O(n) scan)
   useEffect(() => {
     if (!subtitleEnabled || subtitleCues.length === 0) return;
     let raf;
@@ -1059,7 +1143,20 @@ export const Room = ({ roomId, userName, isHost, onLeave }) => {
       const v = videoRef.current;
       if (v) {
         const t = v.currentTime;
-        const cue = subtitleCues.find((c) => t >= c.start && t <= c.end);
+        // Binary search for the last cue whose start <= t (cues are sorted)
+        let lo = 0;
+        let hi = subtitleCues.length - 1;
+        let best = -1;
+        while (lo <= hi) {
+          const mid = (lo + hi) >> 1;
+          if (subtitleCues[mid].start <= t) {
+            best = mid;
+            lo = mid + 1;
+          } else {
+            hi = mid - 1;
+          }
+        }
+        const cue = best >= 0 && t < subtitleCues[best].end ? subtitleCues[best] : null;
         const text = cue ? cue.text : '';
         if (text !== activeSubtitleRef.current) {
           activeSubtitleRef.current = text;
@@ -1095,6 +1192,16 @@ export const Room = ({ roomId, userName, isHost, onLeave }) => {
     addToast('همگام‌سازی مجدد انجام شد', 'success');
   };
 
+  // Close the speed menu when clicking anywhere else
+  useEffect(() => {
+    if (!speedMenuOpen) return;
+    const close = (e) => {
+      if (!e.target.closest('[data-speed-menu]')) setSpeedMenuOpen(false);
+    };
+    window.addEventListener('pointerdown', close);
+    return () => window.removeEventListener('pointerdown', close);
+  }, [speedMenuOpen]);
+
   // --- Chat (lazy loading) ---
   const visibleMessages = messages.slice(-chatWindow);
 
@@ -1126,12 +1233,13 @@ export const Room = ({ roomId, userName, isHost, onLeave }) => {
     if (!chatInput.trim()) return;
 
     const newMsg = {
+      id: `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`,
       sender: userName,
       text: chatInput.trim(),
       time: new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })
     };
 
-    setMessages((prev) => [...prev, newMsg]);
+    setMessages((prev) => [...prev, newMsg].slice(-500));
     broadcastRef.current({
       type: 'CHAT_MESSAGE',
       ...newMsg
@@ -1158,9 +1266,21 @@ export const Room = ({ roomId, userName, isHost, onLeave }) => {
     });
   };
 
-  const copyRoomLink = () => {
+  const copyRoomLink = async () => {
     const link = window.location.href;
-    navigator.clipboard.writeText(link);
+    try {
+      await navigator.clipboard.writeText(link);
+    } catch {
+      // Fallback for non-secure contexts / older browsers
+      const ta = document.createElement('textarea');
+      ta.value = link;
+      ta.style.position = 'fixed';
+      ta.style.opacity = '0';
+      document.body.appendChild(ta);
+      ta.select();
+      try { document.execCommand('copy'); } catch (_) {}
+      document.body.removeChild(ta);
+    }
     setIsCopied(true);
     addToast('لینک اتاق کپی شد!', 'success');
     setTimeout(() => setIsCopied(false), 2000);
@@ -1169,8 +1289,9 @@ export const Room = ({ roomId, userName, isHost, onLeave }) => {
   // --- Subtitle download (export current subtitle text) ---
   const downloadSubtitle = () => {
     if (subtitleCues.length === 0) return;
-    const name = subtitleName || 'subtitle.srt';
-    const blob = new Blob([subtitleSourceRef.current], { type: 'text/plain' });
+    const name = (subtitleName || 'subtitle.srt').replace(/\.(srt|vtt|txt)$/i, '') + '.srt';
+    const content = subtitleSourceRef.current || cuesToSrt(subtitleCues);
+    const blob = new Blob([content], { type: 'text/plain' });
     const objUrl = URL.createObjectURL(blob);
     const a = document.createElement('a');
     a.href = objUrl;
@@ -1180,44 +1301,49 @@ export const Room = ({ roomId, userName, isHost, onLeave }) => {
     addToast(`زیرنویس «${name}» دانلود شد`, 'success');
   };
 
-  // --- Keyboard shortcuts ---
+  // --- Keyboard shortcuts (single listener; latest handler via ref) ---
+  const keyHandlerRef = useRef(null);
+  keyHandlerRef.current = (e) => {
+    if (modalOpenRef.current) return; // never fire behind an open modal
+    if (e.target.tagName === 'INPUT' || e.target.tagName === 'TEXTAREA' || e.target.isContentEditable) return;
+    if (e.target.closest('button')) return; // let focused buttons handle their own activation
+    switch (e.key) {
+      case ' ':
+        e.preventDefault();
+        togglePlay();
+        break;
+      case 'ArrowRight':
+        skipBy(e.shiftKey ? 60 : SKIP_SECONDS);
+        break;
+      case 'ArrowLeft':
+        skipBy(-(e.shiftKey ? 60 : SKIP_SECONDS));
+        break;
+      case 'f':
+      case 'F':
+        if (canControlRef.current) enterFullscreen();
+        else requestControl('fullscreen');
+        break;
+      case 'm':
+      case 'M':
+        if (videoRef.current) {
+          videoRef.current.muted = !videoRef.current.muted;
+          setIsMuted(videoRef.current.muted);
+        }
+        break;
+      case 'c':
+      case 'C':
+        if (subtitleCues.length > 0) setSubtitleEnabled((s) => !s);
+        break;
+      default:
+        break;
+    }
+  };
+
   useEffect(() => {
-    const onKey = (e) => {
-      if (e.target.tagName === 'INPUT' || e.target.tagName === 'TEXTAREA' || e.target.isContentEditable) return;
-      switch (e.key) {
-        case ' ':
-          e.preventDefault();
-          togglePlay();
-          break;
-        case 'ArrowRight':
-          skipBy(e.shiftKey ? 60 : SKIP_SECONDS);
-          break;
-        case 'ArrowLeft':
-          skipBy(-(e.shiftKey ? 60 : SKIP_SECONDS));
-          break;
-        case 'f':
-        case 'F':
-          if (canControlRef.current) enterFullscreen();
-          else requestControl('fullscreen');
-          break;
-        case 'm':
-        case 'M':
-          if (videoRef.current) {
-            videoRef.current.muted = !isMuted;
-            setIsMuted(!isMuted);
-          }
-          break;
-        case 'c':
-        case 'C':
-          setSubtitleEnabled((s) => !s);
-          break;
-        default:
-          break;
-      }
-    };
+    const onKey = (e) => keyHandlerRef.current?.(e);
     window.addEventListener('keydown', onKey);
     return () => window.removeEventListener('keydown', onKey);
-  });
+  }, []);
 
   // --- User management ---
   const openManageModal = (user) => {
@@ -1319,7 +1445,7 @@ export const Room = ({ roomId, userName, isHost, onLeave }) => {
           {/* Player Wrapper: everything lives here so fullscreen keeps all UI */}
           <div
             ref={playerWrapRef}
-            className="relative w-full aspect-video bg-black rounded-2xl md:rounded-3xl overflow-hidden border border-red-500/20 shadow-[0_0_40px_rgba(239,68,68,0.15)] group flex items-center justify-center gpu-layer bg-zinc-950"
+            className="relative w-full aspect-video bg-black rounded-2xl md:rounded-3xl overflow-hidden border border-red-500/20 shadow-[0_0_40px_rgba(239,68,68,0.15)] group flex items-center justify-center bg-zinc-950"
           >
             {/* Floating Reactions Overlay */}
             <div className="absolute inset-0 pointer-events-none overflow-hidden z-20">
@@ -1362,15 +1488,25 @@ export const Room = ({ roomId, userName, isHost, onLeave }) => {
                     setBuffered(v.buffered.end(v.buffered.length - 1));
                   }
                 }}
-                onLoadStart={() => setCodecError(false)}
+                onLoadStart={() => { setCodecError(false); setVideoError(''); }}
                 onLoadedMetadata={() => {
                   if (videoRef.current) {
                     setDuration(videoRef.current.duration);
+                    setBuffered(0);
                   }
                 }}
                 onError={() => {
-                  if (videoRef.current?.error?.code === 4) {
+                  const code = videoRef.current?.error?.code;
+                  if (code === 4) {
                     setCodecError(true);
+                    setIsPlaying(false);
+                  } else if (code) {
+                    const msgs = {
+                      1: 'بارگذاری ویدیو متوقف شد',
+                      2: 'اتصال به سرور ویدیو برقرار نشد (ممکن است لینک منقضی یا غیرفعال باشد)',
+                      3: 'پخش این ویدیو ممکن نیست'
+                    };
+                    setVideoError(msgs[code] || 'خطایی در بارگذاری ویدیو رخ داد');
                     setIsPlaying(false);
                   }
                 }}
@@ -1395,6 +1531,7 @@ export const Room = ({ roomId, userName, isHost, onLeave }) => {
                 onPlay={() => setIsPlaying(true)}
                 onPause={() => setIsPlaying(false)}
                 onClick={togglePlay}
+                onDoubleClick={() => { if (canControlRef.current) enterFullscreen(); }}
               />
             )}
 
@@ -1418,8 +1555,28 @@ export const Room = ({ roomId, userName, isHost, onLeave }) => {
               </div>
             )}
 
+            {/* Generic video error overlay (network / decode) */}
+            {videoError && !codecError && (
+              <div className="absolute inset-0 z-30 bg-black/85 flex flex-col items-center justify-center gap-4 p-6 text-center">
+                <WifiOff className="w-12 h-12 md:w-16 md:h-16 text-red-500/70" />
+                <p className="text-sm md:text-base text-gray-200 font-persian">{videoError}</p>
+                <div className="flex flex-wrap justify-center gap-2">
+                  <button onClick={retryVideo} className="btn-primary text-xs md:text-sm">
+                    <RefreshCw className="w-4 h-4" />
+                    تلاش مجدد
+                  </button>
+                  {canControl && (
+                    <button onClick={() => { setVideoError(''); setIsUrlModalOpen(true); }} className="btn-secondary text-xs md:text-sm">
+                      <Film className="w-4 h-4" />
+                      تغییر ویدیو
+                    </button>
+                  )}
+                </div>
+              </div>
+            )}
+
             {/* Buffering overlay (10s pre-buffer after a video change) */}
-            {isBuffering && videoUrl && !codecError && (
+            {isBuffering && videoUrl && !codecError && !videoError && (
               <div className="absolute inset-0 z-30 bg-black/70 backdrop-blur-sm flex flex-col items-center justify-center gap-3">
                 <Loader2 className="w-10 h-10 md:w-14 md:h-14 text-red-500 animate-spin" />
                 <p className="text-sm md:text-base text-gray-200 font-persian">در حال بارگذاری ویدیو...</p>
@@ -1447,7 +1604,9 @@ export const Room = ({ roomId, userName, isHost, onLeave }) => {
                     textShadow: subtitleSettings.textShadow
                       ? '0 2px 8px rgba(0,0,0,0.8), 0 0 2px rgba(0,0,0,0.9)'
                       : 'none',
-                    backgroundColor: subtitleSettings.backgroundColor,
+                    backgroundColor: subtitleSettings.backgroundColor === 'transparent'
+                      ? 'transparent'
+                      : hexToRgba(subtitleSettings.backgroundColor, 0.75),
                     backdropFilter: `blur(${subtitleSettings.backgroundBlur}px)`,
                     WebkitBackdropFilter: `blur(${subtitleSettings.backgroundBlur}px)`,
                     padding: '8px 16px',
@@ -1534,8 +1693,12 @@ export const Room = ({ roomId, userName, isHost, onLeave }) => {
                       value={currentTime}
                       onChange={handleSeek}
                       onPointerUp={handleSeekRelease}
+                      onKeyUp={(e) => { if (e.key.startsWith('Arrow')) handleSeekRelease(e); }}
                       disabled={isBuffering}
+                      aria-label="نوار پیشرفت ویدیو"
+                      dir="ltr"
                       className="neon-range w-full"
+                      style={{ '--fill': `${duration ? Math.min(100, (currentTime / duration) * 100) : 0}%` }}
                     />
                   </div>
 
@@ -1544,25 +1707,25 @@ export const Room = ({ roomId, userName, isHost, onLeave }) => {
                   <div className="flex items-center gap-1.5 md:gap-2">
                     {controlsDir === 'rtl' ? (
                       <>
-                        <button onClick={() => skipBy(-SKIP_SECONDS)} title="عقب ۱۰ ثانیه" className="p-1.5 hover:text-red-400 transition-colors rounded-lg hover:bg-red-500/10">
+                        <button onClick={() => skipBy(-SKIP_SECONDS)} title="عقب ۱۰ ثانیه" aria-label="عقب ۱۰ ثانیه" className="p-1.5 hover:text-red-400 transition-colors rounded-lg hover:bg-red-500/10">
                           <Rewind className="w-4 h-4 md:w-5 md:h-5" />
                         </button>
-                        <button onClick={togglePlay} disabled={isBuffering} className="p-1.5 hover:text-red-400 transition-colors rounded-lg hover:bg-red-500/10">
+                        <button onClick={togglePlay} disabled={isBuffering} aria-label={isPlaying ? 'توقف' : 'پخش'} className="p-1.5 hover:text-red-400 transition-colors rounded-lg hover:bg-red-500/10">
                           {isBuffering ? <Loader2 className="w-4 h-4 md:w-5 md:h-5 animate-spin" /> : (isPlaying ? <Pause className="w-4 h-4 md:w-5 md:h-5" /> : <Play className="w-4 h-4 md:w-5 md:h-5" />)}
                         </button>
-                        <button onClick={() => skipBy(SKIP_SECONDS)} title="جلو ۱۰ ثانیه" className="p-1.5 hover:text-red-400 transition-colors rounded-lg hover:bg-red-500/10">
+                        <button onClick={() => skipBy(SKIP_SECONDS)} title="جلو ۱۰ ثانیه" aria-label="جلو ۱۰ ثانیه" className="p-1.5 hover:text-red-400 transition-colors rounded-lg hover:bg-red-500/10">
                           <FastForward className="w-4 h-4 md:w-5 md:h-5" />
                         </button>
                       </>
                     ) : (
                       <>
-                        <button onClick={() => skipBy(SKIP_SECONDS)} title="Forward 10s" className="p-1.5 hover:text-red-400 transition-colors rounded-lg hover:bg-red-500/10">
+                        <button onClick={() => skipBy(SKIP_SECONDS)} title="Forward 10s" aria-label="Forward 10s" className="p-1.5 hover:text-red-400 transition-colors rounded-lg hover:bg-red-500/10">
                           <FastForward className="w-4 h-4 md:w-5 md:h-5" />
                         </button>
-                        <button onClick={togglePlay} disabled={isBuffering} className="p-1.5 hover:text-red-400 transition-colors rounded-lg hover:bg-red-500/10">
+                        <button onClick={togglePlay} disabled={isBuffering} aria-label={isPlaying ? 'Pause' : 'Play'} className="p-1.5 hover:text-red-400 transition-colors rounded-lg hover:bg-red-500/10">
                           {isBuffering ? <Loader2 className="w-4 h-4 md:w-5 md:h-5 animate-spin" /> : (isPlaying ? <Pause className="w-4 h-4 md:w-5 md:h-5" /> : <Play className="w-4 h-4 md:w-5 md:h-5" />)}
                         </button>
-                        <button onClick={() => skipBy(-SKIP_SECONDS)} title="Back 10s" className="p-1.5 hover:text-red-400 transition-colors rounded-lg hover:bg-red-500/10">
+                        <button onClick={() => skipBy(-SKIP_SECONDS)} title="Back 10s" aria-label="Back 10s" className="p-1.5 hover:text-red-400 transition-colors rounded-lg hover:bg-red-500/10">
                           <Rewind className="w-4 h-4 md:w-5 md:h-5" />
                         </button>
                       </>
@@ -1572,10 +1735,11 @@ export const Room = ({ roomId, userName, isHost, onLeave }) => {
                       <button
                         onClick={() => {
                           if (videoRef.current) {
-                            videoRef.current.muted = !isMuted;
-                            setIsMuted(!isMuted);
+                            videoRef.current.muted = !videoRef.current.muted;
+                            setIsMuted(videoRef.current.muted);
                           }
                         }}
+                        aria-label={isMuted ? 'فعال کردن صدا' : 'بی‌صدا کردن'}
                         className="p-1.5 hover:text-red-400 transition-colors rounded-lg hover:bg-red-500/10"
                       >
                         {isMuted ? <VolumeX className="w-4 h-4 md:w-5 md:h-5 text-red-400" /> : <Volume2 className="w-4 h-4 md:w-5 md:h-5" />}
@@ -1592,14 +1756,18 @@ export const Room = ({ roomId, userName, isHost, onLeave }) => {
                           setIsMuted(v === 0);
                           if (videoRef.current) videoRef.current.volume = v;
                         }}
+                        aria-label="میزان صدا"
+                        dir="ltr"
                         className="neon-range w-14 md:w-20 hidden md:block"
                       />
                     </div>
 
                     {/* Speed menu */}
-                    <div className="relative">
+                    <div className="relative" data-speed-menu>
                       <button
                         onClick={() => setSpeedMenuOpen((s) => !s)}
+                        aria-label="سرعت پخش"
+                        aria-expanded={speedMenuOpen}
                         className="p-1.5 hover:text-red-400 transition-colors rounded-lg hover:bg-red-500/10 font-mono"
                         title="سرعت پخش"
                       >
@@ -1629,6 +1797,7 @@ export const Room = ({ roomId, userName, isHost, onLeave }) => {
                     <button
                       onClick={() => setSubtitleModalOpen(true)}
                       disabled={subtitleCues.length === 0}
+                      aria-label="تنظیمات زیرنویس"
                       title="تنظیمات زیرنویس (C)"
                       className={`p-1.5 transition-colors rounded-lg hover:bg-red-500/10 disabled:opacity-30 ${subtitleEnabled && subtitleCues.length ? 'text-red-400' : 'hover:text-red-400'}`}
                     >
@@ -1638,6 +1807,7 @@ export const Room = ({ roomId, userName, isHost, onLeave }) => {
                     {/* RTL / LTR toggle */}
                     <button
                       onClick={() => setControlsDir((d) => (d === 'rtl' ? 'ltr' : 'rtl'))}
+                      aria-label="تغییر جهت دکمه‌ها"
                       title="تغییر جهت دکمه‌ها (RTL/LTR)"
                       className="p-1.5 hover:text-red-400 transition-colors rounded-lg hover:bg-red-500/10"
                     >
@@ -1651,6 +1821,7 @@ export const Room = ({ roomId, userName, isHost, onLeave }) => {
                     </span>
                     <button
                       onClick={togglePip}
+                      aria-label="تصویر در تصویر"
                       title="تصویر در تصویر"
                       className="p-1.5 hover:text-red-400 transition-colors rounded-lg hover:bg-red-500/10"
                     >
@@ -1664,6 +1835,7 @@ export const Room = ({ roomId, userName, isHost, onLeave }) => {
                         }
                         enterFullscreen();
                       }}
+                      aria-label={isFullscreen ? 'خروج از تمام صفحه' : 'تمام صفحه'}
                       className="p-1.5 hover:text-red-400 transition-colors rounded-lg hover:bg-red-500/10 flex items-center gap-1"
                     >
                       {isFullscreen ? <Minimize className="w-4 h-4 md:w-5 md:h-5" /> : <Maximize className="w-4 h-4 md:w-5 md:h-5" />}
@@ -1724,6 +1896,415 @@ export const Room = ({ roomId, userName, isHost, onLeave }) => {
                 </span>
               </div>
             )}
+
+            {/* --- In-wrapper modals: stay visible inside fullscreen --- */}
+
+            {/* Change Video Modal (URL + Subtitles) */}
+            <Modal isOpen={isUrlModalOpen} onClose={() => setIsUrlModalOpen(false)} title="تغییر ویدیو و زیرنویس">
+              <div className="space-y-4">
+                <p className="text-sm text-gray-300 font-persian">لینک مستقیم ویدیو را وارد کنید (MP4/WebM/MKV):</p>
+
+                <form onSubmit={handleCustomUrlSubmit} className="space-y-3">
+                  <label className="block text-xs text-gray-400">لینک مستقیم (URL):</label>
+                  <div className="flex gap-2">
+                    <input
+                      type="url"
+                      value={customUrlInput}
+                      onChange={(e) => setCustomUrlInput(e.target.value)}
+                      placeholder="https://.../movie.mp4"
+                      className="input-field text-xs py-2"
+                      autoFocus
+                    />
+                    <button type="submit" className="btn-primary py-2 px-4 text-xs whitespace-nowrap shrink-0">
+                      پخش
+                    </button>
+                  </div>
+                  <p className="text-[10px] text-gray-500">
+                    پس از تایید، برای هماهنگی همهٔ کاربران {BUFFER_SECONDS} ثانیه صبر می‌شود و سپس پخش شروع می‌شود.
+                  </p>
+                </form>
+
+                <div className="pt-3 border-t border-white/10 space-y-3">
+                  <label className="block text-xs text-gray-400">زیرنویس (SRT / WebVTT):</label>
+                  <div className="flex gap-2">
+                    <input
+                      type="url"
+                      value={subUrlInput}
+                      onChange={(e) => setSubUrlInput(e.target.value)}
+                      placeholder="https://.../movie.srt"
+                      className="input-field text-xs py-2"
+                    />
+                    <button
+                      onClick={() => {
+                        if (!subUrlInput.trim()) return;
+                        loadSubtitleUrl(subUrlInput.trim());
+                        setSubUrlInput('');
+                      }}
+                      className="btn-secondary py-2 px-4 text-xs whitespace-nowrap shrink-0"
+                    >
+                      بارگذاری
+                    </button>
+                  </div>
+                  <div className="flex items-center justify-between gap-2">
+                    <label className="btn-secondary flex-1 py-2 text-xs gap-1.5 cursor-pointer">
+                      <Subtitles className="w-3.5 h-3.5 text-red-400" />
+                      آپلود فایل زیرنویس
+                      <input
+                        ref={subtitleFileRef}
+                        type="file"
+                        accept=".srt,.vtt,.txt"
+                        className="hidden"
+                        onChange={(e) => {
+                          handleSubtitleFile(e.target.files?.[0]);
+                          e.target.value = '';
+                        }}
+                      />
+                    </label>
+                    {subtitleName && (
+                      <span className="text-[9px] text-emerald-400 truncate font-mono" dir="ltr">
+                        ✓ {subtitleName}
+                      </span>
+                    )}
+                  </div>
+
+                  <div className="pt-1 space-y-2">
+                    <button
+                      onClick={async () => {
+                        const url = videoUrlRef.current;
+                        if (!url) {
+                          setMkvError('ابتدا یک ویدیو انتخاب کنید');
+                          return;
+                        }
+                        setMkvLoading(true);
+                        setMkvError('');
+                        setMkvTracks([]);
+                        try {
+                          let res;
+                          try {
+                            res = await fetch(url, {
+                              mode: 'cors',
+                              signal: AbortSignal.timeout(60000)
+                            });
+                          } catch (fetchErr) {
+                            throw fetchErr;
+                          }
+                          if (res.type === 'opaque') throw new TypeError('CORS blocked');
+                          if (!res.ok) throw new Error(`HTTP ${res.status}: ${res.statusText}`);
+                          const buf = await res.arrayBuffer();
+                          const tracks = await extractMkvSubtitles(buf);
+                          setMkvTracks(tracks);
+                          if (tracks.length === 0) setMkvError('زیرنویس داخلی در این ویدیو یافت نشد');
+                          else addToast(`${tracks.length} ترک زیرنویس یافت شد`, 'success');
+                        } catch (e) {
+                          const msg = e?.message || String(e);
+                          const corsBlocked = e instanceof TypeError
+                            || msg.includes('CORS')
+                            || msg.includes('cross-origin')
+                            || msg.includes('Failed to fetch')
+                            || msg.includes('NetworkError');
+                          if (corsBlocked) {
+                            setMkvError('CORS blocked: سرور ویدیو اجازه خواندن مستقیم را نمی‌دهد. فایل را دانلود و آپلود کنید یا از لینک مستقیم SRT استفاده کنید.');
+                          } else {
+                            setMkvError('استخراج ناموفق بود: ' + msg);
+                          }
+                        } finally {
+                          setMkvLoading(false);
+                        }
+                      }}
+                      disabled={mkvLoading}
+                      className="btn-secondary w-full text-xs gap-1.5 disabled:opacity-50"
+                    >
+                      {mkvLoading ? <Loader2 className="w-3.5 h-3.5 animate-spin" /> : <Film className="w-3.5 h-3.5 text-red-400" />}
+                      استخراج زیرنویس داخلی (MKV)
+                    </button>
+                    {mkvError && <p className="text-[10px] text-red-400">{mkvError}</p>}
+                    {mkvTracks.length > 0 && (
+                      <div className="space-y-1.5">
+                        {mkvTracks.map((t) => (
+                          <div key={t.trackNumber} className="flex items-center justify-between gap-2 glass-card p-2 rounded-lg">
+                            <span className="text-[10px] text-gray-300 truncate" dir="ltr">
+                              #{t.trackNumber} · {t.type}{t.language ? ` · ${t.language}` : ''}{t.name ? ` · ${t.name}` : ''}
+                            </span>
+                            <button
+                              onClick={() => loadSubtitleCues(t.cues, `${t.language || 'sub'} (MKV #${t.trackNumber})`)}
+                              className="btn-primary py-1 px-2 text-[10px] shrink-0"
+                            >
+                              بارگذاری
+                            </button>
+                          </div>
+                        ))}
+                      </div>
+                    )}
+                  </div>
+                </div>
+              </div>
+            </Modal>
+
+            {/* Subtitle Settings Modal */}
+            <Modal
+              isOpen={subtitleModalOpen}
+              onClose={() => setSubtitleModalOpen(false)}
+              title="تنظیمات زیرنویس"
+            >
+              <div className="space-y-5">
+                {/* Enable/Disable toggle */}
+                <div className="flex items-center justify-between p-3 glass-card rounded-xl">
+                  <div className="flex items-center gap-3">
+                    <div className="w-10 h-10 rounded-xl bg-red-600/20 border border-red-500/30 flex items-center justify-center">
+                      <Subtitles className="w-5 h-5 text-red-400" />
+                    </div>
+                    <div>
+                      <h4 className="font-bold text-white">زیرنویس</h4>
+                      <p className="text-[10px] text-gray-400">فعال/غیرفعال کردن نمایش زیرنویس</p>
+                    </div>
+                  </div>
+                  <button
+                    onClick={() => setSubtitleEnabled((s) => !s)}
+                    aria-label="فعال/غیرفعال کردن زیرنویس"
+                    className={`relative w-12 h-7 rounded-full transition-all ${subtitleEnabled ? 'bg-red-500' : 'bg-gray-600'}`}
+                    role="switch"
+                    aria-checked={subtitleEnabled}
+                  >
+                    <span
+                      className={`absolute top-0.5 bottom-0.5 w-6 rounded-full bg-white transition-transform shadow-lg ${subtitleEnabled ? 'translate-x-5' : 'translate-x-0.5'}`}
+                    />
+                  </button>
+                </div>
+
+                <div className="border-t border-white/5 pt-2 space-y-4">
+                  {/* Font Size */}
+                  <div className="glass-card p-4 rounded-xl">
+                    <div className="flex items-center justify-between mb-3">
+                      <div className="flex items-center gap-2">
+                        <Type className="w-5 h-5 text-red-400" />
+                        <span className="font-medium text-white">اندازه فونت</span>
+                      </div>
+                      <span className="text-sm font-mono text-red-400 bg-red-500/10 px-2 py-0.5 rounded">
+                        {subtitleSettings.fontSize}px
+                      </span>
+                    </div>
+                    <div className="flex items-center gap-3">
+                      <button
+                        onClick={() => setSubtitleSettings((s) => ({ ...s, fontSize: Math.max(12, s.fontSize - 2) }))}
+                        aria-label="کاهش اندازه فونت"
+                        className="p-2 rounded-lg bg-red-500/20 hover:bg-red-500/30 text-red-400 transition-colors"
+                      >
+                        <Minus className="w-5 h-5" />
+                      </button>
+                      <input
+                        type="range"
+                        min="12"
+                        max="48"
+                        step="2"
+                        value={subtitleSettings.fontSize}
+                        onChange={(e) => setSubtitleSettings((s) => ({ ...s, fontSize: Number(e.target.value) }))}
+                        aria-label="اندازه فونت زیرنویس"
+                        className="flex-1 neon-range"
+                      />
+                      <button
+                        onClick={() => setSubtitleSettings((s) => ({ ...s, fontSize: Math.min(48, s.fontSize + 2) }))}
+                        aria-label="افزایش اندازه فونت"
+                        className="p-2 rounded-lg bg-red-500/20 hover:bg-red-500/30 text-red-400 transition-colors"
+                      >
+                        <Plus className="w-5 h-5" />
+                      </button>
+                    </div>
+                  </div>
+
+                  {/* Font Color */}
+                  <div className="glass-card p-4 rounded-xl">
+                    <div className="flex items-center justify-between mb-3">
+                      <div className="flex items-center gap-2">
+                        <Palette className="w-5 h-5 text-red-400" />
+                        <span className="font-medium text-white">رنگ فونت</span>
+                      </div>
+                      <input
+                        type="color"
+                        value={subtitleSettings.fontColor}
+                        onChange={(e) => setSubtitleSettings((s) => ({ ...s, fontColor: e.target.value }))}
+                        aria-label="رنگ فونت زیرنویس"
+                        className="w-10 h-10 rounded-lg border border-white/10 cursor-pointer"
+                      />
+                    </div>
+                    <div className="flex gap-2 flex-wrap">
+                      {['#ffffff', '#ffeb3b', '#00e676', '#ff1744', '#2979ff', '#ff9100'].map((color) => (
+                        <button
+                          key={color}
+                          onClick={() => setSubtitleSettings((s) => ({ ...s, fontColor: color }))}
+                          aria-label={`رنگ ${color}`}
+                          className={`w-8 h-8 rounded-lg border-2 transition-all ${subtitleSettings.fontColor === color ? 'border-red-400 scale-110' : 'border-white/10 hover:border-red-500/50'}`}
+                          style={{ backgroundColor: color }}
+                        />
+                      ))}
+                    </div>
+                  </div>
+
+                  {/* Background Color */}
+                  <div className="glass-card p-4 rounded-xl">
+                    <div className="flex items-center justify-between mb-3">
+                      <div className="flex items-center gap-2">
+                        <div className="w-5 h-5 rounded bg-gradient-to-r from-red-500 to-orange-500" />
+                        <span className="font-medium text-white">پس‌زمینه</span>
+                      </div>
+                      <input
+                        type="color"
+                        value={subtitleSettings.backgroundColor === 'transparent' ? '#000000' : subtitleSettings.backgroundColor}
+                        onChange={(e) => setSubtitleSettings((s) => ({ ...s, backgroundColor: e.target.value }))}
+                        aria-label="رنگ پس‌زمینه زیرنویس"
+                        className="w-10 h-10 rounded-lg border border-white/10 cursor-pointer"
+                      />
+                    </div>
+                    <div className="flex gap-2 flex-wrap">
+                      {['#000000', '#1c1c24', '#8b0000', 'transparent'].map((bg) => (
+                        <button
+                          key={bg}
+                          onClick={() => setSubtitleSettings((s) => ({ ...s, backgroundColor: bg }))}
+                          aria-label={`پس‌زمینه ${bg === 'transparent' ? 'شفاف' : bg}`}
+                          className={`w-20 h-10 rounded-lg border-2 flex items-center justify-center text-[10px] font-mono transition-all ${subtitleSettings.backgroundColor === bg ? 'border-red-400 scale-110' : 'border-white/10 hover:border-red-500/50'}`}
+                          style={{ backgroundColor: bg }}
+                        >
+                          {bg === 'transparent' ? 'بدون' : ''}
+                        </button>
+                      ))}
+                    </div>
+                  </div>
+
+                  {/* Background Blur */}
+                  <div className="glass-card p-4 rounded-xl">
+                    <div className="flex items-center justify-between mb-3">
+                      <div className="flex items-center gap-2">
+                        <SlidersHorizontal className="w-5 h-5 text-red-400" />
+                        <span className="font-medium text-white">بلور پس‌زمینه</span>
+                      </div>
+                      <span className="text-sm font-mono text-red-400 bg-red-500/10 px-2 py-0.5 rounded">
+                        {subtitleSettings.backgroundBlur}px
+                      </span>
+                    </div>
+                    <input
+                      type="range"
+                      min="0"
+                      max="20"
+                      step="1"
+                      value={subtitleSettings.backgroundBlur}
+                      onChange={(e) => setSubtitleSettings((s) => ({ ...s, backgroundBlur: Number(e.target.value) }))}
+                      aria-label="میزان بلور پس‌زمینه"
+                      className="neon-range"
+                    />
+                  </div>
+
+                  {/* Vertical Position */}
+                  <div className="glass-card p-4 rounded-xl">
+                    <div className="flex items-center justify-between mb-3">
+                      <div className="flex items-center gap-2">
+                        <div className="w-5 h-5 rounded border-2 border-red-400 relative">
+                          <div className="absolute bottom-0 left-1/2 -translate-x-1/2 w-1.5 h-1.5 bg-red-400 rounded-full" />
+                        </div>
+                        <span className="font-medium text-white">موقعیت عمودی</span>
+                      </div>
+                      <span className="text-sm font-mono text-red-400 bg-red-500/10 px-2 py-0.5 rounded">
+                        {subtitleSettings.verticalOffset}px از پایین
+                      </span>
+                    </div>
+                    <input
+                      type="range"
+                      min="8"
+                      max="200"
+                      step="4"
+                      value={subtitleSettings.verticalOffset}
+                      onChange={(e) => setSubtitleSettings((s) => ({ ...s, verticalOffset: Number(e.target.value) }))}
+                      aria-label="موقعیت عمودی زیرنویس"
+                      className="neon-range"
+                    />
+                    <div className="flex justify-between text-[10px] text-gray-500 mt-1">
+                      <span>بالا (8px)</span>
+                      <span>پایین (200px)</span>
+                    </div>
+                  </div>
+
+                  {/* Text Shadow Toggle */}
+                  <div className="flex items-center justify-between p-3 glass-card rounded-xl">
+                    <div className="flex items-center gap-3">
+                      <div className="w-10 h-10 rounded-xl bg-purple-600/20 border border-purple-500/30 flex items-center justify-center">
+                        <Type className="w-5 h-5 text-purple-400" />
+                      </div>
+                      <div>
+                        <h4 className="font-bold text-white">سایه متن</h4>
+                        <p className="text-[10px] text-gray-400">افزودن سایه برای خوانایی بهتر</p>
+                      </div>
+                    </div>
+                    <button
+                      onClick={() => setSubtitleSettings((s) => ({ ...s, textShadow: !s.textShadow }))}
+                      aria-label="فعال/غیرفعال کردن سایه متن"
+                      className={`relative w-12 h-7 rounded-full transition-all ${subtitleSettings.textShadow ? 'bg-purple-500' : 'bg-gray-600'}`}
+                      role="switch"
+                      aria-checked={subtitleSettings.textShadow}
+                    >
+                      <span
+                        className={`absolute top-0.5 bottom-0.5 w-6 rounded-full bg-white transition-transform shadow-lg ${subtitleSettings.textShadow ? 'translate-x-5' : 'translate-x-0.5'}`}
+                      />
+                    </button>
+                  </div>
+
+                  {/* Reset Button */}
+                  <button
+                    onClick={() => setSubtitleSettings({
+                      fontSize: 20,
+                      fontColor: '#ffffff',
+                      backgroundColor: '#000000',
+                      backgroundBlur: 4,
+                      verticalOffset: 24,
+                      fontFamily: 'inherit',
+                      textShadow: true,
+                    })}
+                    className="w-full btn-secondary text-sm gap-2"
+                  >
+                    <SlidersHorizontal className="w-4 h-4" />
+                    بازنشانی به پیش‌فرض
+                  </button>
+                </div>
+              </div>
+            </Modal>
+
+            {/* Chat Modal */}
+            <Modal
+              isOpen={chatModalOpen}
+              onClose={() => setChatModalOpen(false)}
+              title="چت اتاق"
+            >
+              <div className="space-y-4">
+                <div
+                  ref={chatModalScrollRef}
+                  className="flex-1 min-h-0 max-h-[60vh] overflow-y-auto space-y-2 p-1 chat-scroll"
+                >
+                  {messages.length === 0 ? (
+                    <p className="text-center text-[10px] text-gray-500 py-8">هنوز پیامی ارسال نشده است</p>
+                  ) : (
+                    messages.map((msg) => (
+                      <div key={msg.id} className="glass-card p-3 rounded-xl border-l-2 border-l-red-500/40 animate-fade-in">
+                        <div className="flex items-center justify-between mb-1">
+                          <span className="font-bold text-red-400 text-xs">{msg.sender}</span>
+                          <span className="text-[9px] text-gray-500">{msg.time}</span>
+                        </div>
+                        <p className="text-gray-200 text-sm break-words">{msg.text}</p>
+                      </div>
+                    ))
+                  )}
+                </div>
+                <form onSubmit={sendChatMessage} className="flex items-center gap-2 shrink-0">
+                  <input
+                    type="text"
+                    value={chatInput}
+                    onChange={(e) => setChatInput(e.target.value)}
+                    placeholder="پیام خود را بنویسید..."
+                    className="input-field py-2 text-sm flex-1"
+                    autoFocus
+                  />
+                  <button type="submit" aria-label="ارسال پیام" className="btn-primary p-2.5 rounded-xl shrink-0">
+                    <Send className="w-5 h-5" />
+                  </button>
+                </form>
+              </div>
+            </Modal>
           </div>
 
           {/* Quick Reactions Bar */}
@@ -1789,8 +2370,8 @@ export const Room = ({ roomId, userName, isHost, onLeave }) => {
                     هنوز پیامی ارسال نشده است. اولین پیام را بفرستید!
                   </div>
                 ) : (
-                  visibleMessages.map((msg, idx) => (
-                    <div key={messages.length - chatWindow + idx} className="glass-card p-2.5 md:p-3 rounded-xl md:rounded-2xl animate-fade-in text-xs md:text-sm border-l-2 border-l-red-500/40">
+                  visibleMessages.map((msg) => (
+                    <div key={msg.id} className="glass-card p-2.5 md:p-3 rounded-xl md:rounded-2xl animate-fade-in text-xs md:text-sm border-l-2 border-l-red-500/40">
                       <div className="flex items-center justify-between mb-1">
                         <span className="font-bold text-red-400 text-[10px] md:text-xs">{msg.sender}</span>
                         <span className="text-[9px] md:text-[10px] text-gray-500">{msg.time}</span>
@@ -1809,7 +2390,7 @@ export const Room = ({ roomId, userName, isHost, onLeave }) => {
                   placeholder="پیام خود را بنویسید..."
                   className="input-field py-2 text-xs md:text-sm"
                 />
-                <button type="submit" className="btn-primary p-2.5 rounded-xl shrink-0">
+                <button type="submit" aria-label="ارسال پیام" className="btn-primary p-2.5 rounded-xl shrink-0">
                   <Send className="w-4 h-4" />
                 </button>
               </form>
@@ -1911,134 +2492,6 @@ export const Room = ({ roomId, userName, isHost, onLeave }) => {
         </div>
       </Modal>
 
-      {/* Change Video Modal (URL + Subtitles) */}
-      <Modal isOpen={isUrlModalOpen} onClose={() => setIsUrlModalOpen(false)} title="تغییر ویدیو و زیرنویس">
-        <div className="space-y-4">
-          <p className="text-sm text-gray-300 font-persian">لینک مستقیم ویدیو را وارد کنید (MP4/WebM/MKV):</p>
-
-          <form onSubmit={handleCustomUrlSubmit} className="space-y-3">
-            <label className="block text-xs text-gray-400">لینک مستقیم (URL):</label>
-            <div className="flex gap-2">
-              <input
-                type="url"
-                value={customUrlInput}
-                onChange={(e) => setCustomUrlInput(e.target.value)}
-                placeholder="https://.../movie.mp4"
-                className="input-field text-xs py-2"
-                autoFocus
-              />
-              <button type="submit" className="btn-primary py-2 px-4 text-xs whitespace-nowrap shrink-0">
-                پخش
-              </button>
-            </div>
-            <p className="text-[10px] text-gray-500">
-              پس از تایید، برای هماهنگی همهٔ کاربران {BUFFER_SECONDS} ثانیه صبر می‌شود و سپس پخش شروع می‌شود.
-            </p>
-          </form>
-
-          <div className="pt-3 border-t border-white/10 space-y-3">
-            <label className="block text-xs text-gray-400">زیرنویس (SRT / WebVTT):</label>
-            <div className="flex gap-2">
-              <input
-                type="url"
-                value={subUrlInput}
-                onChange={(e) => setSubUrlInput(e.target.value)}
-                placeholder="https://.../movie.srt"
-                className="input-field text-xs py-2"
-              />
-              <button
-                onClick={() => {
-                  if (!subUrlInput.trim()) return;
-                  loadSubtitleUrl(subUrlInput.trim());
-                  setSubUrlInput('');
-                }}
-                className="btn-secondary py-2 px-4 text-xs whitespace-nowrap shrink-0"
-              >
-                بارگذاری
-              </button>
-            </div>
-            <div className="flex items-center justify-between gap-2">
-              <label className="btn-secondary flex-1 py-2 text-xs gap-1.5 cursor-pointer">
-                <Subtitles className="w-3.5 h-3.5 text-red-400" />
-                آپلود فایل زیرنویس
-                <input
-                  ref={subtitleFileRef}
-                  type="file"
-                  accept=".srt,.vtt,.txt"
-                  className="hidden"
-                  onChange={(e) => {
-                    handleSubtitleFile(e.target.files?.[0]);
-                    e.target.value = '';
-                  }}
-                />
-              </label>
-              {subtitleName && (
-                <span className="text-[9px] text-emerald-400 truncate font-mono" dir="ltr">
-                  ✓ {subtitleName}
-                </span>
-              )}
-            </div>
-
-            <div className="pt-1 space-y-2">
-              <button
-                onClick={async () => {
-                  const url = videoUrlRef.current;
-                  if (!url) {
-                    setMkvError('ابتدا یک ویدیو انتخاب کنید');
-                    return;
-                  }
-                  setMkvLoading(true);
-                  setMkvError('');
-                  setMkvTracks([]);
-                  try {
-                    // Try to fetch with CORS; if blocked, suggest alternatives
-                    const res = await fetch(url, { mode: 'cors' });
-                    if (!res.ok) throw new Error(`HTTP ${res.status}: ${res.statusText}`);
-                    const buf = await res.arrayBuffer();
-                    const tracks = await extractMkvSubtitles(buf);
-                    setMkvTracks(tracks);
-                    if (tracks.length === 0) setMkvError('زیرنویس داخلی در این ویدیو یافت نشد');
-                    else addToast(`${tracks.length} ترک زیرنویس یافت شد`, 'success');
-                  } catch (e) {
-                    const msg = e?.message || String(e);
-                    if (msg.includes('CORS') || msg.includes('cross-origin') || msg.includes('Failed to fetch')) {
-                      setMkvError('CORS blocked: سرور ویدیو اجازه خواندن مستقیم را نمی‌دهد. فایل را دانلود و آپلود کنید یا از لینک مستقیم SRT استفاده کنید.');
-                    } else {
-                      setMkvError('استخراج ناموفق بود: ' + msg);
-                    }
-                  } finally {
-                    setMkvLoading(false);
-                  }
-                }}
-                disabled={mkvLoading}
-                className="btn-secondary w-full text-xs gap-1.5 disabled:opacity-50"
-              >
-                {mkvLoading ? <Loader2 className="w-3.5 h-3.5 animate-spin" /> : <Film className="w-3.5 h-3.5 text-red-400" />}
-                استخراج زیرنویس داخلی (MKV)
-              </button>
-              {mkvError && <p className="text-[10px] text-red-400">{mkvError}</p>}
-              {mkvTracks.length > 0 && (
-                <div className="space-y-1.5">
-                  {mkvTracks.map((t) => (
-                    <div key={t.trackNumber} className="flex items-center justify-between gap-2 glass-card p-2 rounded-lg">
-                      <span className="text-[10px] text-gray-300 truncate" dir="ltr">
-                        #{t.trackNumber} · {t.type}{t.language ? ` · ${t.language}` : ''}{t.name ? ` · ${t.name}` : ''}
-                      </span>
-                      <button
-                        onClick={() => loadSubtitleCues(t.cues, `${t.language || 'sub'} (MKV #${t.trackNumber})`)}
-                        className="btn-primary py-1 px-2 text-[10px] shrink-0"
-                      >
-                        بارگذاری
-                      </button>
-                    </div>
-                  ))}
-                </div>
-              )}
-            </div>
-          </div>
-        </div>
-      </Modal>
-
       {/* Manage User Modal */}
       <Modal
         isOpen={manageModalOpen}
@@ -2085,276 +2538,6 @@ export const Room = ({ roomId, userName, isHost, onLeave }) => {
             )}
           </div>
         )}
-      </Modal>
-
-      {/* Subtitle Settings Modal */}
-      <Modal
-        isOpen={subtitleModalOpen}
-        onClose={() => setSubtitleModalOpen(false)}
-        title="تنظیمات زیرنویس"
-      >
-        <div className="space-y-5">
-          {/* Enable/Disable toggle */}
-          <div className="flex items-center justify-between p-3 glass-card rounded-xl">
-            <div className="flex items-center gap-3">
-              <div className="w-10 h-10 rounded-xl bg-red-600/20 border border-red-500/30 flex items-center justify-center">
-                <Subtitles className="w-5 h-5 text-red-400" />
-              </div>
-              <div>
-                <h4 className="font-bold text-white">زیرنویس</h4>
-                <p className="text-[10px] text-gray-400">فعال/غیرفعال کردن نمایش زیرنویس</p>
-              </div>
-            </div>
-            <button
-              onClick={() => setSubtitleEnabled((s) => !s)}
-              className={`relative w-12 h-7 rounded-full transition-all ${
-                subtitleEnabled ? 'bg-red-500' : 'bg-gray-600'
-              }`}
-              role="switch"
-              aria-checked={subtitleEnabled}
-            >
-              <span
-                className={`absolute top-0.5 bottom-0.5 w-6 rounded-full bg-white transition-transform shadow-lg ${
-                  subtitleEnabled ? 'translate-x-5' : 'translate-x-0.5'
-                }`}
-              />
-            </button>
-          </div>
-
-          <div className="border-t border-white/5 pt-2 space-y-4">
-            {/* Font Size */}
-            <div className="glass-card p-4 rounded-xl">
-              <div className="flex items-center justify-between mb-3">
-                <div className="flex items-center gap-2">
-                  <Type className="w-5 h-5 text-red-400" />
-                  <span className="font-medium text-white">اندازه فونت</span>
-                </div>
-                <span className="text-sm font-mono text-red-400 bg-red-500/10 px-2 py-0.5 rounded">
-                  {subtitleSettings.fontSize}px
-                </span>
-              </div>
-              <div className="flex items-center gap-3">
-                <button
-                  onClick={() => setSubtitleSettings((s) => ({ ...s, fontSize: Math.max(12, s.fontSize - 2) }))}
-                  className="p-2 rounded-lg bg-red-500/20 hover:bg-red-500/30 text-red-400 transition-colors"
-                  aria-label="کاهش اندازه فونت"
-                >
-                  <Minus className="w-5 h-5" />
-                </button>
-                <input
-                  type="range"
-                  min="12"
-                  max="48"
-                  step="2"
-                  value={subtitleSettings.fontSize}
-                  onChange={(e) => setSubtitleSettings((s) => ({ ...s, fontSize: Number(e.target.value) }))}
-                  className="flex-1 neon-range"
-                />
-                <button
-                  onClick={() => setSubtitleSettings((s) => ({ ...s, fontSize: Math.min(48, s.fontSize + 2) }))}
-                  className="p-2 rounded-lg bg-red-500/20 hover:bg-red-500/30 text-red-400 transition-colors"
-                  aria-label="افزایش اندازه فونت"
-                >
-                  <Plus className="w-5 h-5" />
-                </button>
-              </div>
-            </div>
-
-            {/* Font Color */}
-            <div className="glass-card p-4 rounded-xl">
-              <div className="flex items-center justify-between mb-3">
-                <div className="flex items-center gap-2">
-                  <Palette className="w-5 h-5 text-red-400" />
-                  <span className="font-medium text-white">رنگ فونت</span>
-                </div>
-                <input
-                  type="color"
-                  value={subtitleSettings.fontColor}
-                  onChange={(e) => setSubtitleSettings((s) => ({ ...s, fontColor: e.target.value }))}
-                  className="w-10 h-10 rounded-lg border border-white/10 cursor-pointer"
-                />
-              </div>
-              <div className="flex gap-2 flex-wrap">
-                {['#ffffff', '#ffeb3b', '#00e676', '#ff1744', '#2979ff', '#ff9100'].map((color) => (
-                  <button
-                    key={color}
-                    onClick={() => setSubtitleSettings((s) => ({ ...s, fontColor: color }))}
-                    className={`w-8 h-8 rounded-lg border-2 transition-all ${
-                      subtitleSettings.fontColor === color ? 'border-red-400 scale-110' : 'border-white/10 hover:border-red-500/50'
-                    }`}
-                    style={{ backgroundColor: color }}
-                    aria-label={`رنگ ${color}`}
-                  />
-                ))}
-              </div>
-            </div>
-
-            {/* Background Color */}
-            <div className="glass-card p-4 rounded-xl">
-              <div className="flex items-center justify-between mb-3">
-                <div className="flex items-center gap-2">
-                  <div className="w-5 h-5 rounded bg-gradient-to-r from-red-500 to-orange-500" />
-                  <span className="font-medium text-white">پس‌زمینه</span>
-                </div>
-                <input
-                  type="color"
-                  value={subtitleSettings.backgroundColor}
-                  onChange={(e) => setSubtitleSettings((s) => ({ ...s, backgroundColor: e.target.value }))}
-                  className="w-10 h-10 rounded-lg border border-white/10 cursor-pointer"
-                />
-              </div>
-              <div className="flex gap-2 flex-wrap">
-                {['rgba(0,0,0,0.7)', 'rgba(0,0,0,0.5)', 'rgba(20,20,30,0.8)', 'rgba(139,0,0,0.6)', 'transparent'].map((bg, i) => (
-                  <button
-                    key={i}
-                    onClick={() => setSubtitleSettings((s) => ({ ...s, backgroundColor: bg }))}
-                    className={`w-20 h-10 rounded-lg border-2 flex items-center justify-center text-[10px] font-mono transition-all ${
-                      subtitleSettings.backgroundColor === bg ? 'border-red-400 scale-110' : 'border-white/10 hover:border-red-500/50'
-                    }`}
-                    style={{ backgroundColor: bg }}
-                  >
-                    {bg === 'transparent' ? 'بدون' : 'سایه'}
-                  </button>
-                ))}
-              </div>
-            </div>
-
-            {/* Background Blur */}
-            <div className="glass-card p-4 rounded-xl">
-              <div className="flex items-center justify-between mb-3">
-                <div className="flex items-center gap-2">
-                  <SlidersHorizontal className="w-5 h-5 text-red-400" />
-                  <span className="font-medium text-white">بلور پس‌زمینه</span>
-                </div>
-                <span className="text-sm font-mono text-red-400 bg-red-500/10 px-2 py-0.5 rounded">
-                  {subtitleSettings.backgroundBlur}px
-                </span>
-              </div>
-              <input
-                type="range"
-                min="0"
-                max="20"
-                step="1"
-                value={subtitleSettings.backgroundBlur}
-                onChange={(e) => setSubtitleSettings((s) => ({ ...s, backgroundBlur: Number(e.target.value) }))}
-                className="neon-range"
-              />
-            </div>
-
-            {/* Vertical Position */}
-            <div className="glass-card p-4 rounded-xl">
-              <div className="flex items-center justify-between mb-3">
-                <div className="flex items-center gap-2">
-                  <div className="w-5 h-5 rounded border-2 border-red-400 relative">
-                    <div className="absolute bottom-0 left-1/2 -translate-x-1/2 w-1.5 h-1.5 bg-red-400 rounded-full" />
-                  </div>
-                  <span className="font-medium text-white">موقعیت عمودی</span>
-                </div>
-                <span className="text-sm font-mono text-red-400 bg-red-500/10 px-2 py-0.5 rounded">
-                  {subtitleSettings.verticalOffset}px از پایین
-                </span>
-              </div>
-              <input
-                type="range"
-                min="8"
-                max="200"
-                step="4"
-                value={subtitleSettings.verticalOffset}
-                onChange={(e) => setSubtitleSettings((s) => ({ ...s, verticalOffset: Number(e.target.value) }))}
-                className="neon-range"
-              />
-              <div className="flex justify-between text-[10px] text-gray-500 mt-1">
-                <span>بالا (8px)</span>
-                <span>پایین (200px)</span>
-              </div>
-            </div>
-
-            {/* Text Shadow Toggle */}
-            <div className="flex items-center justify-between p-3 glass-card rounded-xl">
-              <div className="flex items-center gap-3">
-                <div className="w-10 h-10 rounded-xl bg-purple-600/20 border border-purple-500/30 flex items-center justify-center">
-                  <Type className="w-5 h-5 text-purple-400" />
-                </div>
-                <div>
-                  <h4 className="font-bold text-white">سایه متن</h4>
-                  <p className="text-[10px] text-gray-400">افزودن سایه برای خوانایی بهتر</p>
-                </div>
-              </div>
-              <button
-                onClick={() => setSubtitleSettings((s) => ({ ...s, textShadow: !s.textShadow }))}
-                className={`relative w-12 h-7 rounded-full transition-all ${
-                  subtitleSettings.textShadow ? 'bg-purple-500' : 'bg-gray-600'
-                }`}
-                role="switch"
-                aria-checked={subtitleSettings.textShadow}
-              >
-                <span
-                  className={`absolute top-0.5 bottom-0.5 w-6 rounded-full bg-white transition-transform shadow-lg ${
-                    subtitleSettings.textShadow ? 'translate-x-5' : 'translate-x-0.5'
-                  }`}
-                />
-              </button>
-            </div>
-
-            {/* Reset Button */}
-            <button
-              onClick={() => setSubtitleSettings({
-                fontSize: 20,
-                fontColor: '#ffffff',
-                backgroundColor: 'rgba(0, 0, 0, 0.7)',
-                backgroundBlur: 4,
-                verticalOffset: 24,
-                fontFamily: 'inherit',
-                textShadow: true,
-              })}
-              className="w-full btn-secondary text-sm gap-2"
-            >
-              <SlidersHorizontal className="w-4 h-4" />
-              بازنشانی به پیش‌فرض
-            </button>
-          </div>
-        </div>
-      </Modal>
-
-      {/* Chat Modal */}
-      <Modal
-        isOpen={chatModalOpen}
-        onClose={() => setChatModalOpen(false)}
-        title="چت اتاق"
-      >
-        <div className="space-y-4">
-          <div
-            ref={chatModalScrollRef}
-            className="flex-1 min-h-0 max-h-[60vh] overflow-y-auto space-y-2 p-1 chat-scroll"
-          >
-            {messages.length === 0 ? (
-              <p className="text-center text-[10px] text-gray-500 py-8">هنوز پیامی ارسال نشده است</p>
-            ) : (
-              messages.map((msg, idx) => (
-                <div key={idx} className="glass-card p-3 rounded-xl border-l-2 border-l-red-500/40 animate-fade-in">
-                  <div className="flex items-center justify-between mb-1">
-                    <span className="font-bold text-red-400 text-xs">{msg.sender}</span>
-                    <span className="text-[9px] text-gray-500">{msg.time}</span>
-                  </div>
-                  <p className="text-gray-200 text-sm break-words">{msg.text}</p>
-                </div>
-              ))
-            )}
-          </div>
-          <form onSubmit={sendChatMessage} className="flex items-center gap-2 shrink-0">
-            <input
-              type="text"
-              value={chatInput}
-              onChange={(e) => setChatInput(e.target.value)}
-              placeholder="پیام خود را بنویسید..."
-              className="input-field py-2 text-sm flex-1"
-              autoFocus
-            />
-            <button type="submit" className="btn-primary p-2.5 rounded-xl shrink-0">
-              <Send className="w-5 h-5" />
-            </button>
-          </form>
-        </div>
       </Modal>
 
     </div>

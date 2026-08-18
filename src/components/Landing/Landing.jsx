@@ -3,10 +3,18 @@ import { Film, Users, Plus, ArrowRight, Sparkles, Tv, ShieldCheck, Zap, Link as 
 import { useToast } from '../../context/ToastContext';
 
 export const Landing = ({ onJoinRoom, inviteRoomId }) => {
-  const [name, setName] = useState('');
+  const [name, setName] = useState(() => sessionStorage.getItem('bebinim-name') || '');
   const [roomIdInput, setRoomIdInput] = useState('');
   const [mode, setMode] = useState(inviteRoomId ? 'invite' : 'menu'); // 'menu' | 'create' | 'join' | 'invite'
   const { addToast } = useToast();
+
+  const handleNameChange = (e) => {
+    const value = e.target.value;
+    setName(value);
+    if (value.trim()) sessionStorage.setItem('bebinim-name', value.trim());
+  };
+
+  const normalizeRoomCode = (code) => code.trim().toLowerCase().replace(/[^a-z0-9]/g, '');
 
   const handleCreate = (e) => {
     e.preventDefault();
@@ -25,11 +33,16 @@ export const Landing = ({ onJoinRoom, inviteRoomId }) => {
       addToast('لطفاً نام خود را وارد کنید', 'warning');
       return;
     }
-    if (!roomIdInput.trim()) {
+    const code = normalizeRoomCode(roomIdInput);
+    if (!code) {
       addToast('لطفاً کد روم را وارد کنید', 'warning');
       return;
     }
-    onJoinRoom(roomIdInput.trim(), name.trim(), false);
+    if (code.length < 4 || code.length > 10) {
+      addToast('کد روم معتبر نیست (۴ تا ۱۰ کاراکتر)', 'warning');
+      return;
+    }
+    onJoinRoom(code, name.trim(), false);
     addToast('در حال اتصال به روم...', 'info');
   };
 
@@ -44,13 +57,13 @@ export const Landing = ({ onJoinRoom, inviteRoomId }) => {
   };
 
   return (
-    <div className="h-screen flex flex-col items-center justify-center p-4 relative overflow-hidden bg-black">
+    <div className="min-h-dvh flex flex-col items-center justify-center p-4 relative overflow-y-auto overflow-x-hidden bg-black">
       {/* Decorative background glow elements */}
-      <div className="absolute top-1/4 -right-20 w-96 h-96 bg-red-600/15 rounded-full blur-3xl pointer-events-none"></div>
-      <div className="absolute bottom-1/4 -left-20 w-96 h-96 bg-rose-600/20 rounded-full blur-3xl pointer-events-none"></div>
+      <div className="absolute top-1/4 -right-20 w-64 h-64 md:w-96 md:h-96 bg-red-600/15 rounded-full blur-3xl pointer-events-none"></div>
+      <div className="absolute bottom-1/4 -left-20 w-64 h-64 md:w-96 md:h-96 bg-rose-600/20 rounded-full blur-3xl pointer-events-none"></div>
       <div className="absolute top-1/2 left-1/2 -translate-x-1/2 -translate-y-1/2 w-[600px] h-[600px] bg-accent/5 rounded-full blur-3xl pointer-events-none"></div>
 
-      <div className="max-w-xl w-full mx-auto relative z-10 animate-fade-in">
+      <div className="max-w-xl w-full mx-auto relative z-10 animate-fade-in py-6">
         {/* Logo & Header */}
         <div className="text-center mb-8">
           <div className="inline-flex items-center justify-center w-20 h-20 rounded-3xl bg-zinc-950 border border-red-500/30 shadow-[0_0_35px_rgba(239,68,68,0.35)] mb-4 animate-float">
@@ -102,7 +115,7 @@ export const Landing = ({ onJoinRoom, inviteRoomId }) => {
                 <input
                   type="text"
                   value={name}
-                  onChange={(e) => setName(e.target.value)}
+                  onChange={handleNameChange}
                   placeholder="مثال: سارا..."
                   className="input-field"
                   maxLength={25}
@@ -123,7 +136,7 @@ export const Landing = ({ onJoinRoom, inviteRoomId }) => {
                 <input
                   type="text"
                   value={name}
-                  onChange={(e) => setName(e.target.value)}
+                  onChange={handleNameChange}
                   placeholder="مثال: کوروش..."
                   className="input-field"
                   maxLength={25}
@@ -228,9 +241,9 @@ export const Landing = ({ onJoinRoom, inviteRoomId }) => {
                 <input
                   type="text"
                   value={roomIdInput}
-                  onChange={(e) => setRoomIdInput(e.target.value)}
+                  onChange={(e) => setRoomIdInput(normalizeRoomCode(e.target.value))}
                   placeholder="کد ۶ رقمی دریافتی از دوستتان..."
-                  className="input-field uppercase tracking-widest font-mono"
+                  className="input-field tracking-widest font-mono lowercase"
                   maxLength={12}
                 />
               </div>

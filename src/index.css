@@ -11,22 +11,13 @@
   --color-primary-hex: #ef4444;
   --color-secondary-hex: #be123c;
   --color-accent-hex: #ff0000;
-
-  -webkit-user-select: none;
-  -moz-user-select: none;
-  -ms-user-select: none;
-  user-select: none;
-  -webkit-user-drag: none;
-  cursor: default;
 }
 
-/* Allow selection only in inputs and text areas */
-input, textarea, [contenteditable] {
-  -webkit-user-select: text;
-  -moz-user-select: text;
-  -ms-user-select: text;
-  user-select: text;
-  cursor: text;
+/* App shell: keep text selectable (room codes, links, chat messages) but
+   prevent accidental image/UI dragging */
+img, video, [draggable="true"] {
+  -webkit-user-drag: none;
+  user-select: none;
 }
 
 * {
@@ -71,22 +62,13 @@ body {
 
 /* ============ Neon Red Surface Primitives ============ */
 
-/* Dark app surface panel (replaces glassmorphism) */
-.glass-panel {
-  background: #0a0a0a;
-  border: 1px solid rgba(255, 255, 255, 0.08);
-  backdrop-filter: blur(16px);
-  -webkit-backdrop-filter: blur(16px);
-  box-shadow: 0 8px 32px 0 rgba(0, 0, 0, 0.6);
-}
-
 /* Card: zinc surface that lights up red on hover */
 .glass-card {
   background: rgba(24, 24, 27, 0.6);
   backdrop-filter: blur(12px);
   -webkit-backdrop-filter: blur(12px);
   border: 1px solid rgba(255, 255, 255, 0.06);
-  transition: all 0.3s cubic-bezier(0.4, 0, 0.2, 1);
+  transition: transform 0.3s cubic-bezier(0.4, 0, 0.2, 1), border-color 0.3s ease, box-shadow 0.3s ease;
 }
 
 .glass-card:hover {
@@ -107,24 +89,9 @@ body {
   to { opacity: 1; transform: translateY(0); }
 }
 
-@keyframes pulseGlow {
-  0%, 100% { box-shadow: 0 0 15px rgba(239, 68, 68, 0.3); }
-  50% { box-shadow: 0 0 35px rgba(239, 68, 68, 0.8); }
-}
-
 @keyframes float {
   0%, 100% { transform: translateY(0); }
   50% { transform: translateY(-8px); }
-}
-
-@keyframes shimmer {
-  0% { transform: translateX(-100%); }
-  100% { transform: translateX(100%); }
-}
-
-@keyframes scanline {
-  0% { top: -20%; }
-  100% { top: 120%; }
 }
 
 @keyframes wave {
@@ -132,27 +99,19 @@ body {
   100% { transform: rotate(360deg); }
 }
 
-@keyframes glitch {
-  2%, 64% { transform: translate(2px, 0) skew(0deg); }
-  4%, 60% { transform: translate(-2px, 0) skew(0deg); }
-  62% { transform: translate(0, 0) skew(5deg); }
+@keyframes toastProgress {
+  from { width: 100%; }
+  to { width: 0%; }
 }
 
 .animate-fade-in { animation: fadeIn 0.4s cubic-bezier(0.16, 1, 0.3, 1) forwards; }
 .animate-slide-up { animation: slideUp 0.5s ease-out; }
-.animate-pulse-glow { animation: pulseGlow 3s infinite ease-in-out; }
 .animate-float { animation: float 4s infinite ease-in-out; }
-.animate-shimmer { animation: shimmer 2s linear infinite; }
-.animate-scanline { animation: scanline 4s linear infinite; }
-.animate-glitch { animation: glitch 1s linear infinite; }
+.toast-progress { width: 100%; animation: toastProgress linear forwards; }
 
 /* Neon text glow */
 .neon-text {
   text-shadow: 0 0 10px rgba(255, 0, 0, 0.6), 0 0 25px rgba(239, 68, 68, 0.4);
-}
-
-.neon-red-glow {
-  box-shadow: 0 0 20px rgba(239, 68, 68, 0.4);
 }
 
 /* ============ Buttons ============ */
@@ -240,9 +199,13 @@ input[type="range"].neon-range {
   appearance: none;
   height: 6px;
   border-radius: 9999px;
-  background: rgba(255, 255, 255, 0.15);
+  background: linear-gradient(90deg, #ef4444 var(--fill, 0%), rgba(255, 255, 255, 0.15) var(--fill, 0%));
   outline: none;
   cursor: pointer;
+}
+
+input[type="range"].neon-range:focus-visible {
+  box-shadow: 0 0 0 3px rgba(239, 68, 68, 0.4);
 }
 
 input[type="range"].neon-range::-webkit-slider-thumb {
@@ -273,15 +236,9 @@ input[type="range"].neon-range::-moz-range-thumb {
   cursor: pointer;
 }
 
-/* Clip-path for hexagon decorations */
-.clip-path-hexagon {
-  clip-path: polygon(50% 0%, 100% 25%, 100% 75%, 50% 100%, 0% 75%, 0% 25%);
-}
-
 /* ============ GPU / Skia Rendering Optimizations ============ */
-/* Promote animated elements to their own compositor layers so the browser
-   (Chromium renders with Skia) rasterizes and composites them on the GPU
-   instead of repainting on the CPU every frame. */
+/* Promote short-lived animated elements (reactions, loader waves) to their
+   own compositor layers so the browser rasterizes them on the GPU. */
 .gpu-layer {
   transform: translateZ(0);
   will-change: transform;
@@ -298,9 +255,11 @@ video {
   background: #000;
 }
 
-/* Subtitle readability (works over any video frame) */
-.subtitle-text {
-  text-shadow: 0 2px 10px rgba(0, 0, 0, 0.95), 0 0 4px rgba(0, 0, 0, 0.9), 0 1px 2px rgba(0, 0, 0, 0.8);
+/* Consistent keyboard focus ring across the app */
+:focus-visible {
+  outline: 2px solid #ef4444;
+  outline-offset: 2px;
+  border-radius: 4px;
 }
 
 /* Touch devices: bigger range thumb for fat fingers (auto-hide handled in JS) */

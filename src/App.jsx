@@ -1,8 +1,14 @@
-import React, { useState, useEffect } from 'react';
+import React, { useState, useEffect, useCallback, lazy, Suspense } from 'react';
 import { ToastProvider } from './context/ToastContext';
 import { Landing } from './components/Landing/Landing';
-import { Room } from './components/Room/Room';
 import { LoadingScreen } from './components/LoadingScreen';
+import { Loader2 } from 'lucide-react';
+
+// Room pulls in peerjs (~90 KB) — load it only when a room is actually entered
+const Room = lazy(() => import('./components/Room/Room'));
+
+const normalizeRoomId = (id) =>
+  String(id || '').trim().toLowerCase().replace(/[^a-z0-9]/g, '');
 
 export function App() {
   const [roomState, setRoomState] = useState({
@@ -12,34 +18,43 @@ export function App() {
     isHost: false,
   });
   const [isLoading, setIsLoading] = useState(true);
+  const [inviteRoomId, setInviteRoomId] = useState(() =>
+    normalizeRoomId(new URLSearchParams(window.location.search).get('room')) || null
+  );
 
-  // Read invite room id from the URL on load (opened via shared room link)
-  const [inviteRoomId] = useState(() => {
-    const params = new URLSearchParams(window.location.search);
-    return params.get('room') || null;
-  });
-
-  // If a user lands on the main page with no invite param, nothing to pre-fill
+  // Keep app state in sync with browser back/forward navigation
   useEffect(() => {
-    if (!inviteRoomId) return;
-    // The Landing will detect inviteRoomId and route directly to name-entry
-  }, [inviteRoomId]);
+    const onPop = () => {
+      const room = normalizeRoomId(new URLSearchParams(window.location.search).get('room')) || null;
+      setInviteRoomId(room);
+      setRoomState((prev) => {
+        if (!room && prev.inRoom) {
+          return { inRoom: false, roomId: null, userName: '', isHost: false };
+        }
+        return prev;
+      });
+    };
+    window.addEventListener('popstate', onPop);
+    return () => window.removeEventListener('popstate', onPop);
+  }, []);
 
-  const handleJoinRoom = (roomId, userName, isHost) => {
+  const handleJoinRoom = useCallback((roomId, userName, isHost) => {
+    const clean = normalizeRoomId(roomId);
+    if (!clean) return;
     // Update URL query params without reloading page
     const url = new URL(window.location);
-    url.searchParams.set('room', roomId);
+    url.searchParams.set('room', clean);
     window.history.pushState({}, '', url);
 
     setRoomState({
       inRoom: true,
-      roomId,
+      roomId: clean,
       userName,
       isHost,
     });
-  };
+  }, []);
 
-  const handleLeaveRoom = () => {
+  const handleLeaveRoom = useCallback(() => {
     const url = new URL(window.location);
     url.searchParams.delete('room');
     window.history.pushState({}, '', url);
@@ -50,18 +65,26 @@ export function App() {
       userName: '',
       isHost: false,
     });
-  };
+  }, []);
 
   return (
     <ToastProvider>
       {isLoading && <LoadingScreen onComplete={() => setIsLoading(false)} />}
       {roomState.inRoom ? (
-        <Room
-          roomId={roomState.roomId}
-          userName={roomState.userName}
-          isHost={roomState.isHost}
-          onLeave={handleLeaveRoom}
-        />
+        <Suspense
+          fallback={
+            <div className="h-dvh w-full bg-black flex items-center justify-center">
+              <Loader2 className="w-10 h-10 text-red-500 animate-spin" />
+            </div>
+          }
+        >
+          <Room
+            roomId={roomState.roomId}
+            userName={roomState.userName}
+            isHost={roomState.isHost}
+            onLeave={handleLeaveRoom}
+          />
+        </Suspense>
       ) : (
         <Landing onJoinRoom={handleJoinRoom} inviteRoomId={inviteRoomId} />
       )}

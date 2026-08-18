@@ -1,62 +1,92 @@
-import React, { useEffect, useState } from 'react';
+import React, { useEffect, useRef, useState } from 'react';
 import { Film } from 'lucide-react';
+
+const LOADER_MS = 2600;
+const FADE_MS = 500;
 
 export const LoadingScreen = ({ onComplete }) => {
   const [progress, setProgress] = useState(0);
   const [isFading, setIsFading] = useState(false);
+  const doneRef = useRef(false);
 
   useEffect(() => {
-    const interval = setInterval(() => {
-      setProgress((prev) => {
-        if (prev >= 100) {
-          clearInterval(interval);
-          setTimeout(() => {
-            setIsFading(true);
-            setTimeout(onComplete, 800);
-          }, 800);
-          return 100;
-        }
-        return prev + 1;
-      });
-    }, 30);
+    if (window.matchMedia?.('(prefers-reduced-motion: reduce)').matches) {
+      const t = setTimeout(onComplete, 60);
+      return () => clearTimeout(t);
+    }
 
-    return () => clearInterval(interval);
+    let raf;
+    const fadeTimer = { current: null };
+    const doneTimer = { current: null };
+    const start = performance.now();
+
+    const tick = (now) => {
+      const t = Math.min(1, (now - start) / LOADER_MS);
+      const eased = 1 - Math.pow(1 - t, 2.5);
+      setProgress(Math.round(eased * 100));
+      if (t < 1) {
+        raf = requestAnimationFrame(tick);
+        return;
+      }
+      setProgress(100);
+      fadeTimer.current = setTimeout(() => setIsFading(true), 200);
+      doneTimer.current = setTimeout(() => {
+        if (!doneRef.current) {
+          doneRef.current = true;
+          onComplete();
+        }
+      }, 200 + FADE_MS);
+    };
+
+    raf = requestAnimationFrame(tick);
+    return () => {
+      cancelAnimationFrame(raf);
+      clearTimeout(fadeTimer.current);
+      clearTimeout(doneTimer.current);
+    };
   }, [onComplete]);
+
+  const skip = () => {
+    if (!doneRef.current) {
+      doneRef.current = true;
+      onComplete();
+    }
+  };
 
   return (
     <div
-      className={`fixed inset-0 z-[9999] bg-black flex items-center justify-center transition-all duration-1000 ${
+      className={`fixed inset-0 z-[9999] bg-black flex items-center justify-center transition-all duration-500 ${
         isFading ? 'opacity-0 scale-110 pointer-events-none' : 'opacity-100 scale-100'
       }`}
     >
       {/* Background Ambience */}
       <div className="absolute inset-0 bg-[radial-gradient(circle_at_center,_var(--tw-gradient-stops))] from-red-900/10 via-black to-black opacity-80"></div>
+      <div className="absolute top-1/4 -right-24 w-96 h-96 bg-red-600/10 rounded-full blur-3xl pointer-events-none animate-pulse-slow"></div>
+      <div className="absolute bottom-1/4 -left-24 w-96 h-96 bg-rose-600/10 rounded-full blur-3xl pointer-events-none animate-pulse-slow"></div>
 
-      <div className="relative z-10 flex flex-col items-center gap-12">
+      <div className="relative z-10 flex flex-col items-center gap-10">
         {/* --- LIQUID LOADER --- */}
-        <div className="relative w-48 h-48 rounded-full border-4 border-red-500/30 shadow-[0_0_40px_rgba(239,68,68,0.4)] bg-black overflow-hidden group">
+        <div className="relative w-44 h-44 md:w-48 md:h-48 rounded-full border-4 border-red-500/30 shadow-[0_0_40px_rgba(239,68,68,0.4)] bg-black overflow-hidden">
           {/* The Liquid Container */}
           <div
-            className="absolute left-0 w-full bg-red-600 shadow-[0_0_50px_#ef4444] transition-all duration-100 ease-linear"
+            className="absolute left-0 w-full bg-red-600 shadow-[0_0_50px_#ef4444]"
             style={{
               bottom: 0,
               height: `${progress}%`,
+              transition: 'height 120ms linear',
             }}
           >
             {/* The Wave Surface Animation */}
+            <div className="absolute -top-3 left-[-50%] w-[200%] h-6 bg-red-600 rounded-[40%] animate-wave opacity-80 gpu-layer"></div>
             <div
-              className="absolute -top-3 left-[-50%] w-[200%] h-6 bg-red-600 rounded-[40%] animate-wave opacity-80"
-              style={{ transformOrigin: '50% 50%' }}
-            ></div>
-            <div
-              className="absolute -top-3 left-[-50%] w-[200%] h-6 bg-red-300/30 rounded-[35%] animate-wave opacity-60"
-              style={{ animationDuration: '7s', transformOrigin: '50% 50%' }}
+              className="absolute -top-3 left-[-50%] w-[200%] h-6 bg-red-300/30 rounded-[35%] animate-wave opacity-60 gpu-layer"
+              style={{ animationDuration: '7s' }}
             ></div>
           </div>
 
           {/* Inner Content (Percentage) */}
           <div className="absolute inset-0 flex flex-col items-center justify-center z-20 mix-blend-difference">
-            <span className="text-5xl font-black text-white font-mono tracking-tighter">
+            <span className="text-5xl font-black text-white font-mono tracking-tighter tabular-nums">
               {progress}%
             </span>
           </div>
@@ -79,6 +109,13 @@ export const LoadingScreen = ({ onComplete }) => {
             Initializing P2P Engine
           </p>
         </div>
+
+        <button
+          onClick={skip}
+          className="text-xs text-gray-500 hover:text-red-400 transition-colors font-persian underline underline-offset-4"
+        >
+          ورود به ببینیم
+        </button>
       </div>
     </div>
   );
