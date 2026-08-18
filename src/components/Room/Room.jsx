@@ -3,7 +3,7 @@ import {
   Play, Pause, Volume2, VolumeX, Maximize, Minimize, Share2, Users, MessageSquare,
   Send, Link as LinkIcon, Film, LogOut, Check, Radio, Wifi, RefreshCw,
   Crown, Shield, ShieldOff, UserX, Settings, Loader2, Rewind, FastForward,
-  Subtitles, PictureInPicture, Languages, X, SlidersHorizontal, Palette, Type, Minus, Plus, WifiOff
+  Subtitles, PictureInPicture, Languages, X, SlidersHorizontal, Palette, Type, Minus, Plus, WifiOff, Download
 } from 'lucide-react';
 import { useToast } from '../../context/ToastContext';
 import { Modal } from '../UI/Modal';
@@ -137,6 +137,9 @@ const CHAT_WINDOW = 60;
 const SKIP_SECONDS = 10;
 const SPEEDS = [0.5, 0.75, 1, 1.25, 1.5, 2];
 
+// Matroska/H.265 URL detection (query strings / fragments ignored)
+const isMkvLike = (url) => /\.(mkv|mks|hevc|h265|265)(?:[?#].*)?$/i.test(String(url || ''));
+
 // Subtitle font options for the modern Select (family applied via CSS)
 const SUBTITLE_FONTS = [
   { value: 'inherit', label: 'پیش‌فرض' },
@@ -167,6 +170,18 @@ const fmtTime = (sec) => {
   return `${Math.floor(sec / 60)}:${Math.floor(sec % 60).toString().padStart(2, '0')}`;
 };
 
+// Full player time: "M:SS" under an hour, "H:MM:SS" above (movies are long).
+const fmtPlayerTime = (sec) => {
+  if (!Number.isFinite(sec) || sec < 0) sec = 0;
+  sec = Math.floor(sec);
+  const h = Math.floor(sec / 3600);
+  const m = Math.floor((sec % 3600) / 60);
+  const s = sec % 60;
+  const mm = String(m).padStart(2, '0');
+  const ss = String(s).padStart(2, '0');
+  return h > 0 ? `${h}:${mm}:${ss}` : `${m}:${ss}`;
+};
+
 // ==================== Player controls bar ====================
 // Renders the transport controls + progress bar. `currentTime`/`buffered`
 // live here (fed directly by the <video> element) so the ~2500-line Room
@@ -174,6 +189,7 @@ const fmtTime = (sec) => {
 const PlayerControls = React.memo(function PlayerControls({
   duration, disabled, isPlaying, isMuted, volume, speed, speedMenuOpen,
   controlsDir, subtitleEnabled, subtitleAvailable, isFullscreen, videoRef,
+  videoUrl,
   onSeek, onSeekRelease, onTogglePlay, onSkip, onToggleMute, onVolumeChange,
   onSelectSpeed, onSpeedMenuToggle, onSubtitleSettings, onToggleDir,
   onTogglePip, onToggleFullscreen,
@@ -181,6 +197,9 @@ const PlayerControls = React.memo(function PlayerControls({
   const [currentTime, setCurrentTime] = useState(0);
   const [buffered, setBuffered] = useState(0);
 
+  // The <video> element mounts lazily (only once a URL exists) and is
+  // swapped on video changes — so re-attach on every videoUrl change,
+  // otherwise the listeners attach to nothing and the time stays at 0.
   useEffect(() => {
     const v = videoRef.current;
     if (!v) return;
@@ -200,7 +219,7 @@ const PlayerControls = React.memo(function PlayerControls({
       v.removeEventListener('seeked', onSeeked);
       v.removeEventListener('loadedmetadata', onMeta);
     };
-  }, [videoRef]);
+  }, [videoRef, videoUrl]);
 
   const handleChange = (e) => {
     const t = parseFloat(e.target.value);
@@ -332,9 +351,22 @@ const PlayerControls = React.memo(function PlayerControls({
         </div>
 
         <div className="flex items-center gap-1.5 md:gap-3">
-          <span className="tabular-nums whitespace-nowrap">
-            {Math.floor(currentTime / 60)}:{Math.floor(currentTime % 60).toString().padStart(2, '0')} / {Math.floor(duration / 60)}:{Math.floor(duration % 60).toString().padStart(2, '0')}
+          <span dir="ltr" className="tabular-nums whitespace-nowrap">
+            {fmtPlayerTime(currentTime)} / {fmtPlayerTime(duration)}
           </span>
+          {videoUrl && (
+            <a
+              href={videoUrl}
+              download
+              target="_blank"
+              rel="noopener noreferrer"
+              aria-label="دانلود ویدیو"
+              title="دانلود ویدیو (MKV در iOS با پلیر سیستم باز میشود)"
+              className="p-1.5 hover:text-red-400 transition-colors rounded-lg hover:bg-red-500/10"
+            >
+              <Download className="w-4 h-4 md:w-5 md:h-5" />
+            </a>
+          )}
           <button
             onClick={onTogglePip}
             aria-label="تصویر در تصویر"
@@ -1535,7 +1567,7 @@ export const Room = ({ roomId, userName, isHost, onLeave }) => {
     setDuration(0);
     resetSubtitles();
     setIsUrlModalOpen(false);
-    if (/\.(mkv|mks|hevc|h265|265)$/i.test(url)) {
+    if (isMkvLike(url)) {
       addToast('MKV/H.265: در صورت پشتیبانی نشدن توسط مرورگر، از دکمه دانلود استفاده کنید', 'info');
     }
     const readyAt = Date.now() + BUFFER_SECONDS * 1000;
@@ -2162,13 +2194,41 @@ export const Room = ({ roomId, userName, isHost, onLeave }) => {
                 <p className="text-[10px] md:text-xs text-gray-500 font-persian max-w-md">
                   MP4 (H.264) و WebM (VP9/AV1) بهترین سازگاری را دارند؛ MKV در صورت داشتن کدک پشتیبانی‌شده پخش می‌شود.
                 </p>
-                <button
-                  onClick={() => setCodecError(false)}
-                  className="btn-primary text-xs md:text-sm"
-                >
-                  <Film className="w-4 h-4" />
-                  بستن
-                </button>
+                {isMkvLike(videoUrl) && (
+                  <p className="text-[10px] md:text-xs text-amber-400 font-persian max-w-md">
+                    مرورگرهای iOS (سافاری) قابلیت پخش فرمت MKV را ندارند — فایل را دانلود کنید یا با «پخش در پلیر سیستم» در پلیر QuickTime باز کنید، یا برای پخش داخل برنامه به MP4 تبدیل کنید.
+                  </p>
+                )}
+                <div className="flex flex-wrap justify-center gap-2">
+                  <button
+                    onClick={() => setCodecError(false)}
+                    className="btn-primary text-xs md:text-sm"
+                  >
+                    <Film className="w-4 h-4" />
+                    بستن
+                  </button>
+                  {isMkvLike(videoUrl) && (
+                    <>
+                      <button
+                        onClick={() => { setCodecError(false); window.open(videoUrl, '_blank', 'noopener'); }}
+                        className="btn-secondary text-xs md:text-sm"
+                      >
+                        <Play className="w-4 h-4" />
+                        پخش در پلیر سیستم
+                      </button>
+                      <a
+                        href={videoUrl}
+                        download
+                        target="_blank"
+                        rel="noopener noreferrer"
+                        className="btn-secondary text-xs md:text-sm"
+                      >
+                        <Download className="w-4 h-4" />
+                        دانلود فایل
+                      </a>
+                    </>
+                  )}
+                </div>
               </div>
             )}
 
@@ -2322,6 +2382,7 @@ export const Room = ({ roomId, userName, isHost, onLeave }) => {
                 subtitleAvailable={subtitleCues.length > 0}
                 isFullscreen={isFullscreen}
                 videoRef={videoRef}
+                videoUrl={videoUrl}
                 onSeek={handleSeek}
                 onSeekRelease={handleSeekRelease}
                 onTogglePlay={togglePlay}
@@ -2483,7 +2544,7 @@ export const Room = ({ roomId, userName, isHost, onLeave }) => {
                           try {
                             res = await fetch(url, {
                               mode: 'cors',
-                              signal: AbortSignal.timeout(60000)
+                              signal: AbortSignal.timeout(180000)
                             });
                           } catch (fetchErr) {
                             throw fetchErr;
@@ -2535,6 +2596,36 @@ export const Room = ({ roomId, userName, isHost, onLeave }) => {
                         ))}
                       </div>
                     )}
+                  </div>
+                  <div className="pt-1">
+                    <label className="btn-secondary w-full text-xs gap-1.5 cursor-pointer">
+                      <Subtitles className="w-3.5 h-3.5 text-red-400" />
+                      استخراج از فایل MKV (آپلود — بدون محدودیت CORS)
+                      <input
+                        type="file"
+                        accept=".mkv,.mks"
+                        className="hidden"
+                        onChange={async (e) => {
+                          const file = e.target.files?.[0];
+                          e.target.value = '';
+                          if (!file) return;
+                          setMkvLoading(true);
+                          setMkvError('');
+                          setMkvTracks([]);
+                          try {
+                            const buf = await file.arrayBuffer();
+                            const tracks = await extractMkvSubtitles(buf);
+                            setMkvTracks(tracks);
+                            if (tracks.length === 0) setMkvError('زیرنویس داخلی در این ویدیو یافت نشد');
+                            else addToast(`${tracks.length} ترک زیرنویس یافت شد`, 'success');
+                          } catch (err) {
+                            setMkvError('استخراج ناموفق بود: ' + (err?.message || String(err)));
+                          } finally {
+                            setMkvLoading(false);
+                          }
+                        }}
+                      />
+                    </label>
                   </div>
                 </div>
               </div>

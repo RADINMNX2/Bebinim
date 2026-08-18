@@ -61,8 +61,11 @@ export const stripSubtitleTags = (text) => {
     .trim();
 };
 
-// Fractional seconds: "5" → .500, "50" → .050, "500" → .500
-const fracSeconds = (v) => Number(v) / 10 ** String(v).length;
+// Fractional seconds:
+//  - SRT/VTT: the field is MILLISECONDS ("50" = 50ms → .050), so pad to 3.
+//  - ASS/SSA: the field is CENTISECONDS ("50" = 0.50s), a plain decimal.
+const msFraction = (v) => Number(String(v).padStart(3, '0')) / 1000;
+const centiFraction = (v) => Number(`0.${v}`);
 
 // --- SRT / WebVTT parser ---
 // Blocks are separated by blank lines; the time line may appear anywhere in
@@ -78,8 +81,8 @@ export const parseSubtitles = (text) => {
     const idx = lines.findIndex((l) => timeRe.test(l.trim()));
     if (idx === -1) continue;
     const m = timeRe.exec(lines[idx].trim());
-    const start = +(m[1] || 0) * 3600 + +m[2] * 60 + +m[3] + fracSeconds(m[4]);
-    const end = +(m[5] || 0) * 3600 + +m[6] * 60 + +m[7] + fracSeconds(m[8]);
+    const start = +(m[1] || 0) * 3600 + +m[2] * 60 + +m[3] + msFraction(m[4]);
+    const end = +(m[5] || 0) * 3600 + +m[6] * 60 + +m[7] + msFraction(m[8]);
 
     // Keep the lines BEFORE the time line only if they aren't an SRT index
     // (some files put the index after the time line; most put it before).
@@ -117,7 +120,7 @@ export const parseAss = (text) => {
   const toSec = (v) => {
     const m = /^(?:(\d+):)?(\d{1,2}):(\d{1,2})[.,](\d{1,3})/.exec(String(v).trim());
     if (!m) return NaN;
-    return +(m[1] || 0) * 3600 + +m[2] * 60 + +m[3] + fracSeconds(m[4]);
+    return +(m[1] || 0) * 3600 + +m[2] * 60 + +m[3] + centiFraction(m[4]);
   };
 
   for (const line of norm.split('\n')) {

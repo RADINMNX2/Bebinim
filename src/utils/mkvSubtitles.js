@@ -59,6 +59,8 @@ const readVint = (buf, pos) => {
 
 // Event-driven EBML walker: visits every element without building a tree.
 // The visitor receives (id, dataStart, dataEnd); return false to abort.
+// Elements with "unknown size" (all size bits set — used for live-muxed
+// Segments/Clusters) are treated as extending to the parent's end.
 const walkElements = (buf, start, end, depth, visitor) => {
   if (depth > 64 || start < 0 || end > buf.length) return; // malformed-file guard
   let pos = start;
@@ -70,9 +72,10 @@ const walkElements = (buf, start, end, depth, visitor) => {
     const size = readVint(buf, pos);
     if (!size || pos + size.length > end) return;
     pos += size.length;
+    const unknownSize = size.value === Math.pow(2, size.length * 7) - 1;
     const dataStart = pos;
-    const dataEnd = pos + size.value;
-    if (dataEnd > end) return; // truncated element
+    const dataEnd = unknownSize ? end : pos + size.value;
+    if (!unknownSize && dataEnd > end) return; // truncated element
     if (visitor(id, dataStart, dataEnd) === false) return;
     pos = dataEnd;
   }
@@ -99,18 +102,36 @@ const assToSec = (t) => {
 const stripAssOverrides = (text) =>
   text.replace(/\{[^}]*\}/g, '').replace(/\\N/gi, '\n').replace(/\\([nNh])/g, ' ').trim();
 
+// Standard ASS field order: Layer, Start, End, Style, Name, MarginL/R/V, Effect, Text
+const DEFAULT_ASS_FMT = { start: 1, end: 2, text: 9 };
+
+// Read the Format: line from an ASS header block so non-standard field orders
+// (custom Format: in [Events]) map correctly.
+const parseAssFormat = (header) => {
+  const m = /^Format:\s*(.+)$/im.exec(header);
+  if (!m) return null;
+  const f = m[1].split(',').map((x) => x.trim().toLowerCase());
+  const start = f.indexOf('start');
+  const end = f.indexOf('end');
+  const text = f.indexOf('text');
+  if (start < 0 || end < 0 || text < 0) return null;
+  return { start, end, text };
+};
+
 // Extract every Dialogue line of an ASS/SSA block (blocks may contain several).
 // The regex is created per call so `lastIndex` never leaks across blocks.
-const parseAssBlock = (raw) => {
+const parseAssBlock = (raw, fmt) => {
   const out = [];
+  const f = fmt || DEFAULT_ASS_FMT;
+  const need = Math.max(f.start, f.end, f.text);
   const lineRe = /Dialogue:\s*([^\n]*)/gi;
   let m;
   while ((m = lineRe.exec(raw)) !== null) {
     const fields = m[1].split(',');
-    if (fields.length < 10) continue;
-    const start = assToSec(fields[1]);
-    const end = assToSec(fields[2]);
-    const text = stripAssOverrides(fields.slice(9).join(','));
+    if (fields.length <= need) continue;
+    const start = assToSec(fields[f.start]);
+    const end = assToSec(fields[f.end]);
+    const text = stripAssOverrides(fields.slice(f.text).join(','));
     if (start == null || end == null || !text) continue;
     out.push({ start, end, text });
   }
@@ -119,14 +140,19 @@ const parseAssBlock = (raw) => {
 
 const decodeBlockText = (data, codecId) => {
   const text = new TextDecoder('utf-8').decode(data);
-  if (codecId === 'S_TEXT/UTF8') {
-    // Strip SRT timing lines (with optional trailing WebVTT cue settings) and
-    // any leading cue index line.
+  if (codecId === 'S_TEXT/UTF8' || codecId === 'S_TEXT/WEBVTT') {
+    // Strip SRT/WebVTT timing lines (with optional trailing cue settings),
+    // WebVTT headers (WEBVTT / NOTE / X-TIMESTAMP-MAP) and any cue index line.
     return text
       .split(/\r?\n/)
       .filter((line) => {
         const l = line.trim();
-        return !(l === '' && false) && !/^\d+$/.test(l) && !/^\s*\d{1,2}:\d{2}:\d{2}[,.]\d{1,3}\s*-->\s*.+$/.test(l);
+        return (
+          !/^\d+$/.test(l) &&
+          !/^(WEBVTT|NOTE)\b/i.test(l) &&
+          !/^X-TIMESTAMP-MAP=/i.test(l) &&
+          !/^\s*\d{1,2}:\d{2}:\d{2}[,.]\d{1,3}\s*-->\s*.+$/.test(l)
+        );
       })
       .join('\n')
       .trim();
@@ -138,8 +164,11 @@ const decodeBlockText = (data, codecId) => {
 };
 
 const fmtTimestamp = (sec) => {
-  const s = Math.max(0, Math.floor(sec));
-  const ms = Math.round((sec - Math.floor(sec)) * 1000);
+  // Round the whole value (not seconds/ms separately) so .9995s never
+  // produces an invalid "00:00:01,1000" SRT timestamp.
+  const totalMs = Math.max(0, Math.round(sec * 1000));
+  const s = Math.floor(totalMs / 1000);
+  const ms = totalMs % 1000;
   const h = Math.floor(s / 3600);
   const m = Math.floor((s % 3600) / 60);
   const rest = s % 60;
@@ -166,9 +195,13 @@ export const extractMkvSubtitles = async (arrayBuffer) => {
       const size = readVint(buf, pos);
       if (!size || pos + size.length > buf.length) throw new Error('فایل MKV نامعتبر است');
       pos += size.length;
-      if (pos + size.value > buf.length) throw new Error('فایل MKV ناقص است');
-      if (id === ID.Segment) segment = { start: pos, end: pos + size.value };
-      pos += size.value;
+      const unknownSize = size.value === Math.pow(2, size.length * 7) - 1;
+      if (id === ID.Segment) {
+        segment = { start: pos, end: unknownSize ? buf.length : pos + size.value };
+        if (unknownSize) break; // Segment runs to EOF — nothing left to scan
+      }
+      if (!unknownSize && pos + size.value > buf.length) throw new Error('فایل MKV ناقص است');
+      pos += unknownSize ? buf.length - pos : size.value;
     }
   }
   if (!segment) throw new Error('Segment یافت نشد');
@@ -198,7 +231,7 @@ export const extractMkvSubtitles = async (arrayBuffer) => {
           else if (eid === ID.Language) track.lang = readStr({ data });
           else if (eid === ID.Name) track.name = readStr({ data });
         });
-        if (track.type === 17 && /S_TEXT\/(UTF8|ASS|SSA)$/.test(track.codec || '')) {
+        if (track.type === 17 && /S_TEXT\/(UTF8|ASS|SSA|WEBVTT)$/.test(track.codec || '')) {
           subTracks.push({
             number: track.number != null ? track.number : subTracks.length + 1,
             codecId: track.codec,
@@ -248,11 +281,18 @@ export const extractMkvSubtitles = async (arrayBuffer) => {
   walkElements(buf, segment.start, segment.end, 0, (id, s, e) => {
     if (id !== ID.Cluster) return;
     let clusterBase = 0;
+    // Pass A: read the cluster Timecode. The spec doesn't guarantee it comes
+    // before the blocks, so resolve it FIRST — blocks stamped with base 0
+    // would all collapse to t=0.
     walkElements(buf, s, e, 1, (cid, cs, ce) => {
       if (cid === ID.Timecode) {
         const v = readUint({ data: buf.subarray(cs, ce) });
         if (v != null) clusterBase = v * scaleToMs;
-      } else if (cid === ID.SimpleBlock) {
+      }
+    });
+    // Pass B: collect subtitle blocks with the resolved base.
+    walkElements(buf, s, e, 1, (cid, cs, ce) => {
+      if (cid === ID.SimpleBlock) {
         pushBlock(cs, ce, true, clusterBase, null);
       } else if (cid === ID.BlockGroup) {
         let blockRange = null;
@@ -276,15 +316,22 @@ export const extractMkvSubtitles = async (arrayBuffer) => {
     trackBlocks.sort((a, b) => a.timeMs - b.timeMs);
 
     const cues = [];
+    let assFmt = null;
     for (const b of trackBlocks) {
       if (!Number.isFinite(b.timeMs)) continue;
       const blockStart = b.timeMs / 1000;
       let start = blockStart;
       let end = b.durationMs != null ? start + b.durationMs / 1000 : start + 2;
       if (t.codecId === 'S_TEXT/ASS' || t.codecId === 'S_TEXT/SSA') {
+        const raw = new TextDecoder('utf-8').decode(b.data);
+        // The first block is usually the ASS header (Script Info / Styles):
+        // grab its Format: line so dialogue fields map correctly.
+        if (assFmt === null && !/Dialogue:/i.test(raw)) {
+          assFmt = parseAssFormat(raw);
+        }
         // Every Dialogue line carries its own timestamps — keep them all
         // instead of stamping the whole block with the first one.
-        const parsed = parseAssBlock(new TextDecoder('utf-8').decode(b.data));
+        const parsed = parseAssBlock(raw, assFmt);
         for (const p of parsed) {
           if (p.start != null && p.end != null && p.end > p.start && p.text) {
             cues.push({ start: p.start, end: p.end, text: p.text });
