@@ -3,16 +3,21 @@ import { X } from 'lucide-react';
 
 export const Modal = ({ isOpen, onClose, title, children }) => {
   const closeBtnRef = useRef(null);
+  const onCloseRef = useRef(onClose);
+  onCloseRef.current = onClose;
 
+  // Only run when the modal (re)opens, NOT on every parent re-render.
+  // Otherwise an inline `onClose` (new identity each render) would re-run this
+  // effect on every keystroke and steal focus from inputs inside the modal.
   useEffect(() => {
     if (!isOpen) return;
     const onKey = (e) => {
-      if (e.key === 'Escape') onClose();
+      if (e.key === 'Escape') onCloseRef.current();
     };
     window.addEventListener('keydown', onKey);
     closeBtnRef.current?.focus();
     return () => window.removeEventListener('keydown', onKey);
-  }, [isOpen, onClose]);
+  }, [isOpen]);
 
   if (!isOpen) return null;
 
