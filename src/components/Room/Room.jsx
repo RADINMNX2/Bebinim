@@ -10,6 +10,7 @@ import { Modal } from '../UI/Modal';
 import { AnimatedInput } from '../UI/AnimatedInput';
 import { Select } from '../UI/Select';
 import { extractMkvSubtitles, cuesToSrt } from '../../utils/mkvSubtitles';
+import { decodeSubtitleBytes, parseSubtitleContent } from '../../utils/subtitleCodec';
 
 // Default free STUN servers to maximize NAT traversal success inside Iran
 const DEFAULT_STUN_SERVERS = [
@@ -151,28 +152,7 @@ const ACTION_LABELS = {
   fullscreen: 'تمام صفحه'
 };
 
-// --- SRT / WebVTT parser (modern subtitles: SRT + VTT) ---
-const parseSubtitles = (text) => {
-  const cues = [];
-  // Optional hours, optional trailing WebVTT cue settings
-  const timeRe = /^(?:(\d{1,2}):)?(\d{2}):(\d{2})[,.](\d{1,3})\s*-->\s*(?:(\d{1,2}):)?(\d{2}):(\d{2})[,.](\d{1,3})/;
-  const frac = (v) => v.padEnd(3, '0');
-  for (const block of text.split(/\r?\n\r?\n/)) {
-    const lines = block.split(/\r?\n/);
-    const idx = lines.findIndex((l) => timeRe.test(l.trim()));
-    if (idx === -1) continue;
-    const m = timeRe.exec(lines[idx].trim());
-    const start = +(m[1] || 0) * 3600 + +m[2] * 60 + +m[3] + +frac(m[4]) / 1000;
-    const end = +(m[5] || 0) * 3600 + +m[6] * 60 + +m[7] + +frac(m[8]) / 1000;
-    const textLines = lines
-      .filter((_, i) => i !== idx)
-      .map((l) => l.replace(/<[^>]+>/g, '').trim());
-    while (textLines.length && /^\d+$/.test(textLines[0])) textLines.shift(); // SRT index line
-    const cueText = textLines.join('\n').trim();
-    if (cueText && start < end) cues.push({ start, end, text: cueText });
-  }
-  return cues.sort((a, b) => a.start - b.start);
-};
+// --- Subtitle parsing (encoding + SRT/VTT/ASS) lives in utils/subtitleCodec.js ---
 
 const hexToRgba = (hex, alpha) => {
   let h = String(hex || '#000000').replace('#', '');
@@ -390,8 +370,23 @@ export const Room = ({ roomId, userName, isHost, onLeave }) => {
   const [customUrlInput, setCustomUrlInput] = useState('');
   const [isPlaying, setIsPlaying] = useState(false);
   const [duration, setDuration] = useState(0);
-  const [volume, setVolume] = useState(1);
-  const [isMuted, setIsMuted] = useState(false);
+  const readStoredVolume = () => {
+    try {
+      const n = parseFloat(localStorage.getItem('bebinim-volume'));
+      return Number.isFinite(n) && n >= 0 && n <= 1 ? n : 1;
+    } catch {
+      return 1;
+    }
+  };
+  const readStoredMuted = () => {
+    try {
+      return localStorage.getItem('bebinim-muted') === '1';
+    } catch {
+      return false;
+    }
+  };
+  const [volume, setVolume] = useState(readStoredVolume);
+  const [isMuted, setIsMuted] = useState(readStoredMuted);
   const [isBuffering, setIsBuffering] = useState(false);
   const [bufferCountdown, setBufferCountdown] = useState(0);
   const [isFullscreen, setIsFullscreen] = useState(false);
@@ -1564,10 +1559,64 @@ export const Room = ({ roomId, userName, isHost, onLeave }) => {
 
   // --- Fullscreen (custom wrapper so reactions & modals appear in FS) ---
   useEffect(() => {
-    const onChange = () => setIsFullscreen(!!document.fullscreenElement);
+    const onChange = () =>
+      setIsFullscreen(!!(document.fullscreenElement || document.webkitFullscreenElement));
     document.addEventListener('fullscreenchange', onChange);
-    return () => document.removeEventListener('fullscreenchange', onChange);
+    document.addEventListener('webkitfullscreenchange', onChange);
+    return () => {
+      document.removeEventListener('fullscreenchange', onChange);
+      document.removeEventListener('webkitfullscreenchange', onChange);
+    };
   }, []);
+
+  // Keep the video element in sync with volume/mute state and persist them
+  // (the element may mount after this effect, so onLoadedMetadata re-applies too)
+  useEffect(() => {
+    const v = videoRef.current;
+    if (v) {
+      v.volume = volume;
+      v.muted = isMuted;
+    }
+    try {
+      localStorage.setItem('bebinim-volume', String(volume));
+      localStorage.setItem('bebinim-muted', isMuted ? '1' : '0');
+    } catch {
+      /* storage unavailable */
+    }
+  }, [volume, isMuted]);
+
+  // Keyboard shortcuts: Space/K play/pause · ←/→ skip · ↑/↓ volume · M mute · F fullscreen
+  // Uses physical key codes (e.code) so they work on Persian keyboard layouts too.
+  useEffect(() => {
+    const onKeyDown = (e) => {
+      const t = e.target;
+      if (t && (t.closest('input, textarea, select, [contenteditable]') || t.tagName === 'BUTTON')) return;
+      if (!videoUrlRef.current || document.querySelector('[role="dialog"]')) return;
+      const code = e.code;
+      if (code === 'Space' && e.repeat) return;
+      if (code === 'Space' || code === 'KeyK') {
+        e.preventDefault();
+        togglePlay();
+      } else if (code === 'ArrowLeft') {
+        e.preventDefault();
+        skipBy(-SKIP_SECONDS);
+      } else if (code === 'ArrowRight') {
+        e.preventDefault();
+        skipBy(SKIP_SECONDS);
+      } else if (code === 'ArrowUp' || code === 'ArrowDown') {
+        e.preventDefault();
+        const cur = videoRef.current?.volume ?? volume;
+        const step = code === 'ArrowUp' ? 0.1 : -0.1;
+        handleVolumeChange(Math.min(1, Math.max(0, Math.round((cur + step) * 100) / 100)));
+      } else if (code === 'KeyM') {
+        toggleMute();
+      } else if (code === 'KeyF') {
+        toggleFullscreen();
+      }
+    };
+    window.addEventListener('keydown', onKeyDown);
+    return () => window.removeEventListener('keydown', onKeyDown);
+  }, [togglePlay, skipBy, handleVolumeChange, toggleMute, toggleFullscreen, volume]);
 
   // Activity listeners keep controls visible; reactions (z-20) stay above and don't block
   useEffect(() => {
@@ -1598,14 +1647,20 @@ export const Room = ({ roomId, userName, isHost, onLeave }) => {
 
   const enterFullscreen = useCallback(() => {
     const el = playerWrapRef.current;
+    const v = videoRef.current;
     if (!el) return;
-    if (document.fullscreenElement) {
-      document.exitFullscreen?.().catch(() => {});
+    const fsEl = document.fullscreenElement || document.webkitFullscreenElement;
+    if (fsEl) {
+      if (document.exitFullscreen) document.exitFullscreen().catch(() => {});
+      else if (document.webkitExitFullscreen) document.webkitExitFullscreen();
     } else if (el.requestFullscreen) {
       el.requestFullscreen?.().catch(() => {});
     } else if (el.webkitRequestFullscreen) {
-      // iOS Safari
+      // iOS Safari (div fullscreen)
       el.webkitRequestFullscreen?.();
+    } else if (v?.webkitEnterFullscreen) {
+      // iOS Safari (video-only fullscreen)
+      v.webkitEnterFullscreen?.();
     }
   }, []);
 
@@ -1648,8 +1703,8 @@ export const Room = ({ roomId, userName, isHost, onLeave }) => {
 
   // --- Subtitles ---
   const loadSubtitleText = (text, name) => {
-    const cues = parseSubtitles(text);
-    subtitleSourceRef.current = text;
+    const cues = parseSubtitleContent(text, name);
+    subtitleSourceRef.current = cuesToSrt(cues);
     activeSubtitleRef.current = '';
     setSubtitleCues(cues);
     setSubtitleName(name);
@@ -1679,7 +1734,8 @@ export const Room = ({ roomId, userName, isHost, onLeave }) => {
     try {
       const res = await fetch(url);
       if (!res.ok) throw new Error(`HTTP ${res.status}`);
-      const text = await res.text();
+      const buf = new Uint8Array(await res.arrayBuffer());
+      const text = decodeSubtitleBytes(buf);
       loadSubtitleText(text, url.split('/').pop().split('?')[0] || 'زیرنویس');
     } catch {
       addToast('بارگذاری زیرنویس ناموفق بود (CORS یا لینک نامعتبر)', 'error');
@@ -1689,8 +1745,8 @@ export const Room = ({ roomId, userName, isHost, onLeave }) => {
   const handleSubtitleFile = (file) => {
     if (!file) return;
     const reader = new FileReader();
-    reader.onload = () => loadSubtitleText(String(reader.result), file.name);
-    reader.readAsText(file);
+    reader.onload = () => loadSubtitleText(decodeSubtitleBytes(new Uint8Array(reader.result)), file.name);
+    reader.readAsArrayBuffer(file);
   };
 
   // Cue tracking loop (rAF + binary search: smooth, no jank, no O(n) scan)
@@ -2059,8 +2115,12 @@ export const Room = ({ roomId, userName, isHost, onLeave }) => {
                 className="w-full h-full object-contain cursor-pointer"
                 onLoadStart={() => { setCodecError(false); setVideoError(''); }}
                 onLoadedMetadata={() => {
-                  if (videoRef.current) {
-                    setDuration(videoRef.current.duration);
+                  const v = videoRef.current;
+                  if (v) {
+                    setDuration(v.duration);
+                    v.playbackRate = userSpeedRef.current;
+                    v.volume = volume;
+                    v.muted = isMuted;
                   }
                 }}
                 onError={() => {
@@ -2189,6 +2249,7 @@ export const Room = ({ roomId, userName, isHost, onLeave }) => {
                     display: 'inline-block',
                     maxWidth: '100%',
                     wordWrap: 'break-word',
+                    whiteSpace: 'pre-line',
                   }}
                 >
                   {subtitleText}
@@ -2409,7 +2470,7 @@ export const Room = ({ roomId, userName, isHost, onLeave }) => {
                       <input
                         ref={subtitleFileRef}
                         type="file"
-                        accept=".srt,.vtt,.txt"
+                        accept=".srt,.vtt,.ass,.ssa,.txt"
                         className="hidden"
                         onChange={(e) => {
                           handleSubtitleFile(e.target.files?.[0]);
