@@ -161,7 +161,7 @@ export const Room = ({ roomId, userName, isHost, onLeave }) => {
   // --- MKV streaming engine (iOS only) + subtitles: logic lives in
   // useMkvEngine.js / useSubtitles.js; Room wires the shared setters. ---
   const {
-    useMkvEngine, mkvEngineRef, enginePhase, setEnginePhase,
+    useMkvEngine: engineActive, mkvEngineRef, enginePhase, setEnginePhase,
     codecError, setCodecError, engineErrorMsg, setEngineErrorMsg, retryVideo,
   } = useMkvEngine({ videoUrl, videoRef, setDuration, setIsPlaying, setVideoError });
 
@@ -1612,7 +1612,7 @@ export const Room = ({ roomId, userName, isHost, onLeave }) => {
             ) : (
               <video
                 ref={videoRef}
-                src={useMkvEngine ? undefined : videoUrl}
+                src={engineActive ? undefined : videoUrl}
                 playsInline
                 preload="auto"
                 aria-label="ویدیو اتاق"
