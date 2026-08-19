@@ -20,19 +20,19 @@ const ID = {
   Name: 0x536e,
   Cluster: 0x1f43b675,
   Timecode: 0xe7,
-  SimpleBlock: 0xa1,
+  SimpleBlock: 0xa3,
   BlockGroup: 0xa0,
-  Block: 0xa3,
+  Block: 0xa1,
   BlockDuration: 0x9b,
 };
 
 // Element IDs are VINTs where the marker bit is KEPT in the value.
-const readId = (buf, pos, len) => {
+export const readId = (buf, pos, len) => {
   let v = 0;
   for (let i = 0; i < len; i += 1) v = (v * 256) + buf[pos + i];
   return v;
 };
-const idLength = (b) => {
+export const idLength = (b) => {
   if (b === undefined || b === null) return 0;
   if (b & 0x80) return 1;
   if (b & 0x40) return 2;
@@ -42,7 +42,7 @@ const idLength = (b) => {
 };
 
 // Sizes / numbers are VINTs where the marker bit is STRIPPED.
-const readVint = (buf, pos) => {
+export const readVint = (buf, pos) => {
   if (!buf || pos < 0 || pos >= buf.length) return null;
   const first = buf[pos];
   let mask = 0x80;
@@ -52,8 +52,10 @@ const readVint = (buf, pos) => {
     len += 1;
   }
   if (mask === 0 || pos + len > buf.length) return null; // no marker bit / truncated
+  // NOTE: arithmetic multiply (NOT `<<`) — bitwise ops truncate to 32 bits
+  // and corrupt any vint >= 2^31 (big clusters, unknown-size segments).
   let val = first & (mask - 1);
-  for (let i = 1; i < len; i += 1) val = (val << 8) | buf[pos + i];
+  for (let i = 1; i < len; i += 1) val = val * 256 + buf[pos + i];
   return { value: val, length: len };
 };
 
@@ -61,7 +63,7 @@ const readVint = (buf, pos) => {
 // The visitor receives (id, dataStart, dataEnd); return false to abort.
 // Elements with "unknown size" (all size bits set — used for live-muxed
 // Segments/Clusters) are treated as extending to the parent's end.
-const walkElements = (buf, start, end, depth, visitor) => {
+export const walkElements = (buf, start, end, depth, visitor) => {
   if (depth > 64 || start < 0 || end > buf.length) return; // malformed-file guard
   let pos = start;
   while (pos < end - 1) {

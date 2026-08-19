@@ -1,107 +1,25 @@
 import React, { useState, useEffect, useRef, useLayoutEffect, useCallback } from 'react';
 import {
-  Play, Pause, Volume2, VolumeX, Maximize, Minimize, Share2, Users, MessageSquare,
-  Send, Link as LinkIcon, Film, LogOut, Check, Radio, Wifi, RefreshCw,
-  Crown, Shield, ShieldOff, UserX, Settings, Loader2, Rewind, FastForward,
-  Subtitles, PictureInPicture, Languages, X, SlidersHorizontal, Palette, Type, Minus, Plus, WifiOff, Download
+  Play, Pause, Share2, Users, MessageSquare, Send, Film, LogOut, Check,
+  Radio, Wifi, RefreshCw, Crown, Shield, Settings, Loader2, WifiOff, Download, X
 } from 'lucide-react';
 import { useToast } from '../../context/ToastContext';
-import { Modal } from '../UI/Modal';
 import { AnimatedInput } from '../UI/AnimatedInput';
-import { Select } from '../UI/Select';
-import { extractMkvSubtitles, cuesToSrt } from '../../utils/mkvSubtitles';
-import { decodeSubtitleBytes, parseSubtitleContent } from '../../utils/subtitleCodec';
-
-// Default free STUN servers to maximize NAT traversal success inside Iran
-const DEFAULT_STUN_SERVERS = [
-  { urls: 'stun:stun.l.google.com:19302' },
-  { urls: 'stun:stun1.l.google.com:19302' },
-  { urls: 'stun:stun2.l.google.com:19302' },
-  { urls: 'stun:stun.cloudflare.com:3478' },
-  { urls: 'stun:stun.services.mozilla.com' },
-  { urls: 'stun:stun.1und1.de:3478' },
-  { urls: 'stun:global.stun.twilio.com:3478' }
-];
-
-// --- Xirsys TURN (free tier) ---
-const XIRSYS = {
-  ident: 'RADINMNX',
-  secret: '25a5cd9e-98ec-11f1-8480-cafcf9cf945e',
-  channel: 'mnx-bebinim'
-};
-const XIRSYS_TTL_MS = 30 * 60 * 1000;
-let xirsysCache = null;
-
-const fetchXirsysTurn = async () => {
-  if (xirsysCache && Date.now() - xirsysCache.fetchedAt < XIRSYS_TTL_MS) {
-    return xirsysCache.servers;
-  }
-  try {
-    const auth = btoa(`${XIRSYS.ident}:${XIRSYS.secret}`);
-    const res = await fetch(`https://global.xirsys.net/_turn/${XIRSYS.channel}?webrtc=1&expire=21600`, {
-      method: 'PUT',
-      headers: { Authorization: `Basic ${auth}` },
-      signal: AbortSignal.timeout(4000)
-    });
-    if (!res.ok) return null;
-    const data = await res.json();
-    if (data?.s !== 'ok' || !data?.v?.iceServers?.length) return null;
-    xirsysCache = { servers: data.v.iceServers, fetchedAt: Date.now() };
-    return data.v.iceServers;
-  } catch (_) {
-    return null;
-  }
-};
-
-const getUrlParams = () => new URLSearchParams(window.location.search);
-
-// Robust TURN URL parser: accepts `turn:user:pass@host`, `turn:user:pass@host:3478`,
-// `turns://user:pass@host:5349`, etc. (the old split(':') logic mangled these).
-const parseTurnParam = (raw) => {
-  if (!raw) return null;
-  const s = raw.includes('://') ? raw.replace('://', ':') : raw;
-  const m = /^turns?:([^:@/]+):([^@]+)@([^:/]+)(?::(\d+))?$/.exec(s);
-  if (!m) return null;
-  const [, username, credential, host, port] = m;
-  const secure = /^turns:/i.test(s);
-  return {
-    urls: `${secure ? 'turns:' : 'turn:'}${host}${port ? `:${port}` : ''}`,
-    username,
-    credential,
-  };
-};
-
-const buildPeerConfig = () => {
-  const iceServers = [...DEFAULT_STUN_SERVERS];
-
-  const turn = parseTurnParam(getUrlParams().get('turn'));
-  if (turn) iceServers.push(turn);
-
-  const config = {
-    host: '0.peerjs.com',
-    port: 443,
-    secure: true,
-    config: { iceServers },
-    debug: 0
-  };
-
-  const sigParam = getUrlParams().get('sig');
-  if (sigParam) {
-    try {
-      const u = new URL(sigParam.includes('://') ? sigParam : `ws://${sigParam}`);
-      config.host = u.hostname;
-      config.port = u.port ? Number(u.port) : (u.protocol === 'wss:' ? 443 : 9000);
-      config.secure = u.protocol === 'wss:';
-    } catch (_) {
-      // malformed sig -> fall back to PeerJS Cloud
-    }
-  }
-  return config;
-};
-
-const PEER_CONFIG = buildPeerConfig();
-const ACTIVE_SIGNALING = getUrlParams().get('sig') || '0.peerjs.com';
-const ACTIVE_TURN = getUrlParams().get('turn') || null;
+import {
+  CHAT_WINDOW, BUFFER_SECONDS, SKIP_SECONDS, EMOJIS, ACTION_LABELS,
+  fmtTime, hexToRgba, safePlay, isMkvLike, readStoredVolume, readStoredMuted,
+  fetchXirsysTurn, PEER_CONFIG, ACTIVE_TURN,
+  SYNC_INTERVAL_MS, SYNC_FAST_INTERVAL_MS, PING_INTERVAL_MS, HEARTBEAT_INTERVAL_MS,
+  HEARTBEAT_TIMEOUT_MS, MAX_RECONNECT_ATTEMPTS, RECONNECT_BASE_MS,
+  MAX_HOST_ID_RETRIES, HOST_ID_RETRY_DELAY_MS, HARD_DRIFT_THRESHOLD,
+  RATE_CORRECTION_GAIN, RATE_CORRECTION_LIMIT, DRIFT_SMA_WINDOW,
+  FAST_AFTER_EVENT_MS, DRIFT_REPORT_MIN_RTT, MAX_CONNECT_RETRIES, RETRY_DELAY_MS,
+} from './constants';
+import PlayerControls from './PlayerControls';
+import { useSubtitleSettings } from './useSubtitleSettings';
+import { useMkvEngine } from './useMkvEngine';
+import { useSubtitles } from './useSubtitles';
+import { ChangeVideoModal, SubtitleSettingsModal, ChatModal, ShareModal, ManageUserModal } from './modals';
 
 // ==================== Sync tuning (world-class smooth sync) ====================
 // 1. Host is the media reference clock; it broadcasts full state every 2s
@@ -115,279 +33,6 @@ const ACTIVE_TURN = getUrlParams().get('turn') || null;
 //    HARD_DRIFT_THRESHOLD triggers a precise seek. Play/pause always align.
 // 4. Video changes force a 10s pre-buffer on EVERY client, gated on a shared
 //    absolute deadline (readyAt). Playback waits for canplay (never stalls).
-const SYNC_INTERVAL_MS = 2000;
-const SYNC_FAST_INTERVAL_MS = 900;
-const PING_INTERVAL_MS = 15000;
-const HEARTBEAT_INTERVAL_MS = 10000;
-const HEARTBEAT_TIMEOUT_MS = 45000;
-const MAX_RECONNECT_ATTEMPTS = 6;
-const RECONNECT_BASE_MS = 1000;
-const MAX_HOST_ID_RETRIES = 5;
-const HOST_ID_RETRY_DELAY_MS = 3000;
-const HARD_DRIFT_THRESHOLD = 1.0;
-const RATE_CORRECTION_GAIN = 0.12;
-const RATE_CORRECTION_LIMIT = 0.08;
-const DRIFT_SMA_WINDOW = 5;
-const FAST_AFTER_EVENT_MS = 5000;
-const DRIFT_REPORT_MIN_RTT = 120; // hard seeks are only safe once the clock is measured
-const BUFFER_SECONDS = 10;
-const MAX_CONNECT_RETRIES = 3;
-const RETRY_DELAY_MS = 2500;
-const CHAT_WINDOW = 60;
-const SKIP_SECONDS = 10;
-const SPEEDS = [0.5, 0.75, 1, 1.25, 1.5, 2];
-
-// Matroska/H.265 URL detection (query strings / fragments ignored)
-const isMkvLike = (url) => /\.(mkv|mks|hevc|h265|265)(?:[?#].*)?$/i.test(String(url || ''));
-
-// Subtitle font options for the modern Select (family applied via CSS)
-const SUBTITLE_FONTS = [
-  { value: 'inherit', label: 'پیش‌فرض' },
-  { value: "'Vazirmatn', sans-serif", label: 'وزیرمتن' },
-  { value: "'Inter', sans-serif", label: 'Inter' },
-  { value: 'Tahoma', label: 'Tahoma' },
-  { value: 'Arial', label: 'Arial' },
-];
-
-const ACTION_LABELS = {
-  toggle: 'پخش / توقف',
-  seek: 'پرش به زمان',
-  fullscreen: 'تمام صفحه'
-};
-
-// --- Subtitle parsing (encoding + SRT/VTT/ASS) lives in utils/subtitleCodec.js ---
-
-const hexToRgba = (hex, alpha) => {
-  let h = String(hex || '#000000').replace('#', '');
-  if (h.length === 3) h = h.split('').map((c) => c + c).join('');
-  const n = parseInt(h, 16);
-  if (!Number.isFinite(n)) return `rgba(0, 0, 0, ${alpha})`;
-  return `rgba(${(n >> 16) & 255}, ${(n >> 8) & 255}, ${n & 255}, ${alpha})`;
-};
-
-const fmtTime = (sec) => {
-  if (!isFinite(sec) || sec < 0) sec = 0;
-  return `${Math.floor(sec / 60)}:${Math.floor(sec % 60).toString().padStart(2, '0')}`;
-};
-
-// Full player time: "M:SS" under an hour, "H:MM:SS" above (movies are long).
-const fmtPlayerTime = (sec) => {
-  if (!Number.isFinite(sec) || sec < 0) sec = 0;
-  sec = Math.floor(sec);
-  const h = Math.floor(sec / 3600);
-  const m = Math.floor((sec % 3600) / 60);
-  const s = sec % 60;
-  const mm = String(m).padStart(2, '0');
-  const ss = String(s).padStart(2, '0');
-  return h > 0 ? `${h}:${mm}:${ss}` : `${m}:${ss}`;
-};
-
-// ==================== Player controls bar ====================
-// Renders the transport controls + progress bar. `currentTime`/`buffered`
-// live here (fed directly by the <video> element) so the ~2500-line Room
-// tree is NOT re-rendered on every `timeupdate`/`progress` event (4-5 Hz).
-const PlayerControls = React.memo(function PlayerControls({
-  duration, disabled, isPlaying, isMuted, volume, speed, speedMenuOpen,
-  controlsDir, subtitleEnabled, subtitleAvailable, isFullscreen, videoRef,
-  videoUrl,
-  onSeek, onSeekRelease, onTogglePlay, onSkip, onToggleMute, onVolumeChange,
-  onSelectSpeed, onSpeedMenuToggle, onSubtitleSettings, onToggleDir,
-  onTogglePip, onToggleFullscreen,
-}) {
-  const [currentTime, setCurrentTime] = useState(0);
-  const [buffered, setBuffered] = useState(0);
-
-  // The <video> element mounts lazily (only once a URL exists) and is
-  // swapped on video changes — so re-attach on every videoUrl change,
-  // otherwise the listeners attach to nothing and the time stays at 0.
-  useEffect(() => {
-    const v = videoRef.current;
-    if (!v) return;
-    const onTime = () => setCurrentTime(v.currentTime);
-    const onProgress = () => {
-      if (v.buffered.length > 0) setBuffered(v.buffered.end(v.buffered.length - 1));
-    };
-    const onSeeked = () => setCurrentTime(v.currentTime);
-    const onMeta = () => { setCurrentTime(0); setBuffered(0); };
-    v.addEventListener('timeupdate', onTime);
-    v.addEventListener('progress', onProgress);
-    v.addEventListener('seeked', onSeeked);
-    v.addEventListener('loadedmetadata', onMeta);
-    return () => {
-      v.removeEventListener('timeupdate', onTime);
-      v.removeEventListener('progress', onProgress);
-      v.removeEventListener('seeked', onSeeked);
-      v.removeEventListener('loadedmetadata', onMeta);
-    };
-  }, [videoRef, videoUrl]);
-
-  const handleChange = (e) => {
-    const t = parseFloat(e.target.value);
-    if (!Number.isFinite(t)) return;
-    setCurrentTime(t);
-    onSeek(t);
-  };
-
-  return (
-    <div className="flex flex-col gap-2.5 md:gap-3 pointer-events-auto" dir={controlsDir}>
-      {/* Progress bar with buffered indicator */}
-      <div className="relative w-full">
-        <div
-          className="absolute top-1/2 -translate-y-1/2 left-0 h-1 rounded-full bg-white/15 pointer-events-none"
-          style={{ width: `${duration ? Math.min(100, (buffered / duration) * 100) : 0}%` }}
-        ></div>
-        <input
-          type="range"
-          min={0}
-          max={duration || 100}
-          value={currentTime}
-          onChange={handleChange}
-          onPointerUp={onSeekRelease}
-          onKeyUp={(e) => { if (e.key.startsWith('Arrow')) onSeekRelease(e); }}
-          disabled={disabled}
-          aria-label="نوار پیشرفت ویدیو"
-          dir="ltr"
-          className="neon-range w-full"
-          style={{ '--fill': `${duration ? Math.min(100, (currentTime / duration) * 100) : 0}%` }}
-        />
-      </div>
-
-      <div className="flex items-center justify-between gap-2 text-[10px] md:text-xs text-gray-300 flex-wrap">
-        {/* Transport controls: RTL/LTR aware */}
-        <div className="flex items-center gap-1.5 md:gap-2">
-          {controlsDir === 'rtl' ? (
-            <>
-              <button onClick={() => onSkip(-SKIP_SECONDS)} title="عقب ۱۰ ثانیه" aria-label="عقب ۱۰ ثانیه" className="p-1.5 hover:text-red-400 transition-colors rounded-lg hover:bg-red-500/10">
-                <Rewind className="w-4 h-4 md:w-5 md:h-5" />
-              </button>
-              <button onClick={onTogglePlay} disabled={disabled} aria-label={isPlaying ? 'توقف' : 'پخش'} className="p-1.5 hover:text-red-400 transition-colors rounded-lg hover:bg-red-500/10">
-                {disabled ? <Loader2 className="w-4 h-4 md:w-5 md:h-5 animate-spin" /> : (isPlaying ? <Pause className="w-4 h-4 md:w-5 md:h-5" /> : <Play className="w-4 h-4 md:w-5 md:h-5" />)}
-              </button>
-              <button onClick={() => onSkip(SKIP_SECONDS)} title="جلو ۱۰ ثانیه" aria-label="جلو ۱۰ ثانیه" className="p-1.5 hover:text-red-400 transition-colors rounded-lg hover:bg-red-500/10">
-                <FastForward className="w-4 h-4 md:w-5 md:h-5" />
-              </button>
-            </>
-          ) : (
-            <>
-              <button onClick={() => onSkip(SKIP_SECONDS)} title="Forward 10s" aria-label="Forward 10s" className="p-1.5 hover:text-red-400 transition-colors rounded-lg hover:bg-red-500/10">
-                <FastForward className="w-4 h-4 md:w-5 md:h-5" />
-              </button>
-              <button onClick={onTogglePlay} disabled={disabled} aria-label={isPlaying ? 'Pause' : 'Play'} className="p-1.5 hover:text-red-400 transition-colors rounded-lg hover:bg-red-500/10">
-                {disabled ? <Loader2 className="w-4 h-4 md:w-5 md:h-5 animate-spin" /> : (isPlaying ? <Pause className="w-4 h-4 md:w-5 md:h-5" /> : <Play className="w-4 h-4 md:w-5 md:h-5" />)}
-              </button>
-              <button onClick={() => onSkip(-SKIP_SECONDS)} title="Back 10s" aria-label="Back 10s" className="p-1.5 hover:text-red-400 transition-colors rounded-lg hover:bg-red-500/10">
-                <Rewind className="w-4 h-4 md:w-5 md:h-5" />
-              </button>
-            </>
-          )}
-
-          <div className="flex items-center gap-1.5 md:gap-2">
-            <button
-              onClick={onToggleMute}
-              aria-label={isMuted ? 'فعال کردن صدا' : 'بی‌صدا کردن'}
-              className="p-1.5 hover:text-red-400 transition-colors rounded-lg hover:bg-red-500/10"
-            >
-              {isMuted ? <VolumeX className="w-4 h-4 md:w-5 md:h-5 text-red-400" /> : <Volume2 className="w-4 h-4 md:w-5 md:h-5" />}
-            </button>
-            <input
-              type="range"
-              min={0}
-              max={1}
-              step={0.05}
-              value={isMuted ? 0 : volume}
-              onChange={(e) => onVolumeChange(parseFloat(e.target.value))}
-              aria-label="میزان صدا"
-              dir="ltr"
-              className="neon-range w-14 md:w-20 hidden md:block"
-            />
-          </div>
-
-          {/* Speed menu */}
-          <div className="relative" data-speed-menu>
-            <button
-              onClick={onSpeedMenuToggle}
-              aria-label="سرعت پخش"
-              aria-expanded={speedMenuOpen}
-              className="p-1.5 hover:text-red-400 transition-colors rounded-lg hover:bg-red-500/10 font-mono"
-              title="سرعت پخش"
-            >
-              {speed}x
-            </button>
-            {speedMenuOpen && (
-              <div className="absolute bottom-8 right-0 z-40 bg-zinc-950 border border-red-500/30 rounded-xl p-1.5 space-y-0.5 shadow-2xl">
-                {SPEEDS.map((s) => (
-                  <button
-                    key={s}
-                    onClick={() => onSelectSpeed(s)}
-                    className={`block w-full text-left px-3 py-1.5 rounded-lg text-xs transition-colors ${s === speed ? 'bg-red-500/20 text-red-400' : 'hover:bg-white/5 text-gray-300'}`}
-                  >
-                    {s}x
-                  </button>
-                ))}
-              </div>
-            )}
-          </div>
-
-          {/* Subtitle settings modal */}
-          <button
-            onClick={onSubtitleSettings}
-            disabled={!subtitleAvailable}
-            aria-label="تنظیمات زیرنویس"
-            title="تنظیمات زیرنویس (C)"
-            className={`p-1.5 transition-colors rounded-lg hover:bg-red-500/10 disabled:opacity-30 ${subtitleEnabled && subtitleAvailable ? 'text-red-400' : 'hover:text-red-400'}`}
-          >
-            <Subtitles className="w-4 h-4 md:w-5 md:h-5" />
-          </button>
-
-          {/* RTL / LTR toggle */}
-          <button
-            onClick={onToggleDir}
-            aria-label="تغییر جهت دکمه‌ها"
-            title="تغییر جهت دکمه‌ها (RTL/LTR)"
-            className="p-1.5 hover:text-red-400 transition-colors rounded-lg hover:bg-red-500/10"
-          >
-            <Languages className="w-4 h-4 md:w-5 md:h-5" />
-          </button>
-        </div>
-
-        <div className="flex items-center gap-1.5 md:gap-3">
-          <span dir="ltr" className="tabular-nums whitespace-nowrap">
-            {fmtPlayerTime(currentTime)} / {fmtPlayerTime(duration)}
-          </span>
-          {videoUrl && (
-            <a
-              href={videoUrl}
-              download
-              target="_blank"
-              rel="noopener noreferrer"
-              aria-label="دانلود ویدیو"
-              title="دانلود ویدیو (MKV در iOS با پلیر سیستم باز میشود)"
-              className="p-1.5 hover:text-red-400 transition-colors rounded-lg hover:bg-red-500/10"
-            >
-              <Download className="w-4 h-4 md:w-5 md:h-5" />
-            </a>
-          )}
-          <button
-            onClick={onTogglePip}
-            aria-label="تصویر در تصویر"
-            title="تصویر در تصویر"
-            className="p-1.5 hover:text-red-400 transition-colors rounded-lg hover:bg-red-500/10"
-          >
-            <PictureInPicture className="w-4 h-4 md:w-5 md:h-5" />
-          </button>
-          <button
-            onClick={onToggleFullscreen}
-            aria-label={isFullscreen ? 'خروج از تمام صفحه' : 'تمام صفحه'}
-            className="p-1.5 hover:text-red-400 transition-colors rounded-lg hover:bg-red-500/10 flex items-center gap-1"
-          >
-            {isFullscreen ? <Minimize className="w-4 h-4 md:w-5 md:h-5" /> : <Maximize className="w-4 h-4 md:w-5 md:h-5" />}
-            <span className="hidden md:inline">{isFullscreen ? 'خروج' : 'تمام صفحه'}</span>
-          </button>
-        </div>
-      </div>
-    </div>
-  );
-});
 
 export const Room = ({ roomId, userName, isHost, onLeave }) => {
   const [connections, setConnections] = useState([]);
@@ -402,54 +47,20 @@ export const Room = ({ roomId, userName, isHost, onLeave }) => {
   const [customUrlInput, setCustomUrlInput] = useState('');
   const [isPlaying, setIsPlaying] = useState(false);
   const [duration, setDuration] = useState(0);
-  const readStoredVolume = () => {
-    try {
-      const n = parseFloat(localStorage.getItem('bebinim-volume'));
-      return Number.isFinite(n) && n >= 0 && n <= 1 ? n : 1;
-    } catch {
-      return 1;
-    }
-  };
-  const readStoredMuted = () => {
-    try {
-      return localStorage.getItem('bebinim-muted') === '1';
-    } catch {
-      return false;
-    }
-  };
   const [volume, setVolume] = useState(readStoredVolume);
   const [isMuted, setIsMuted] = useState(readStoredMuted);
   const [isBuffering, setIsBuffering] = useState(false);
   const [bufferCountdown, setBufferCountdown] = useState(0);
   const [isFullscreen, setIsFullscreen] = useState(false);
-  const [codecError, setCodecError] = useState(false);
   const [videoError, setVideoError] = useState('');
   const [speed, setSpeed] = useState(1);
   const [speedMenuOpen, setSpeedMenuOpen] = useState(false);
 
-  // Subtitles
-  const [subtitleText, setSubtitleText] = useState('');
-  const [subtitleCues, setSubtitleCues] = useState([]);
-  const [subtitleEnabled, setSubtitleEnabled] = useState(false);
-  const [subtitleName, setSubtitleName] = useState('');
-  const [subUrlInput, setSubUrlInput] = useState('');
-  const subtitleFileRef = useRef(null);
-  const subtitleSourceRef = useRef('');
-  const [mkvTracks, setMkvTracks] = useState([]);
-  const [mkvLoading, setMkvLoading] = useState(false);
-  const [mkvError, setMkvError] = useState('');
-
-  // Subtitle settings
-  const [subtitleSettings, setSubtitleSettings] = useState({
-    fontSize: 20,
-    fontColor: '#ffffff',
-    backgroundColor: '#000000',
-    backgroundBlur: 4,
-    verticalOffset: 24, // bottom offset in px
-    fontFamily: 'inherit',
-    textShadow: true,
-  });
-  const [subtitleModalOpen, setSubtitleModalOpen] = useState(false);
+  // Subtitle appearance settings + modal state (useSubtitleSettings.js)
+  const {
+    subtitleSettings, setSubtitleSettings,
+    subtitleModalOpen, setSubtitleModalOpen, resetSubtitleSettings,
+  } = useSubtitleSettings();
   const [chatModalOpen, setChatModalOpen] = useState(false);
 
   // Controls direction (RTL / LTR)
@@ -499,7 +110,6 @@ export const Room = ({ roomId, userName, isHost, onLeave }) => {
   const hideTimerRef = useRef(null);
   const pendingPlayRef = useRef(null);
   const inPlayerChatScrollRef = useRef(null);
-  const chatModalScrollRef = useRef(null);
   const isFullscreenRef = useRef(false);
   isFullscreenRef.current = isFullscreen;
   const chatOpenRef = useRef(false);
@@ -547,6 +157,21 @@ export const Room = ({ roomId, userName, isHost, onLeave }) => {
   const { addToast } = useToast();
 
   useEffect(() => { videoUrlRef.current = videoUrl; }, [videoUrl]);
+
+  // --- MKV streaming engine (iOS only) + subtitles: logic lives in
+  // useMkvEngine.js / useSubtitles.js; Room wires the shared setters. ---
+  const {
+    useMkvEngine, mkvEngineRef, enginePhase, setEnginePhase,
+    codecError, setCodecError, engineErrorMsg, setEngineErrorMsg, retryVideo,
+  } = useMkvEngine({ videoUrl, videoRef, setDuration, setIsPlaying, setVideoError });
+
+  const {
+    subtitleText, subtitleCues, subtitleEnabled, setSubtitleEnabled,
+    subtitleName, subUrlInput, setSubUrlInput, subtitleFileRef,
+    mkvTracks, mkvLoading, mkvError,
+    loadSubtitleUrl, handleSubtitleFile, loadSubtitleCues,
+    resetSubtitles, extractMkvFromUrl, extractMkvFromFile,
+  } = useSubtitles({ videoRef, videoUrlRef, addToast });
 
   // --- Auto-hide controls after inactivity (kept visible while paused) ---
   const showControls = useCallback(() => {
@@ -812,17 +437,6 @@ export const Room = ({ roomId, userName, isHost, onLeave }) => {
   };
 
   // --- Latency-compensated sync application (upgraded) ---
-  const resetSubtitles = () => {
-    activeSubtitleRef.current = '';
-    subtitleSourceRef.current = '';
-    setSubtitleCues([]);
-    setSubtitleName('');
-    setSubtitleText('');
-    setSubtitleEnabled(false);
-    setMkvTracks([]);
-    setMkvError('');
-  };
-
   const applySync = (data) => {
     const video = videoRef.current;
     if (!video) return;
@@ -1564,6 +1178,8 @@ export const Room = ({ roomId, userName, isHost, onLeave }) => {
     videoUrlRef.current = url;
     setVideoUrl(url);
     setCodecError(false);
+    setEngineErrorMsg(null);
+    setEnginePhase(null);
     setDuration(0);
     resetSubtitles();
     setIsUrlModalOpen(false);
@@ -1637,13 +1253,6 @@ export const Room = ({ roomId, userName, isHost, onLeave }) => {
     if (chatModalOpen) setUnreadChat(0);
   }, [chatModalOpen]);
 
-  // Keep the chat modal scrolled to the latest message
-  useEffect(() => {
-    if (chatModalOpen && chatModalScrollRef.current) {
-      chatModalScrollRef.current.scrollTop = chatModalScrollRef.current.scrollHeight;
-    }
-  }, [messages, chatModalOpen]);
-
   const enterFullscreen = useCallback(() => {
     const el = playerWrapRef.current;
     const v = videoRef.current;
@@ -1691,96 +1300,7 @@ export const Room = ({ roomId, userName, isHost, onLeave }) => {
   const openSubtitleSettings = useCallback(() => setSubtitleModalOpen(true), []);
   const toggleControlsDir = useCallback(() => setControlsDir((d) => (d === 'rtl' ? 'ltr' : 'rtl')), []);
 
-  const retryVideo = () => {
-    setVideoError('');
-    const v = videoRef.current;
-    if (v) {
-      v.load();
-      safePlay(v).catch(() => {});
-    }
-  };
-
-  // --- Subtitles ---
-  const loadSubtitleText = (text, name) => {
-    const cues = parseSubtitleContent(text, name);
-    subtitleSourceRef.current = cuesToSrt(cues);
-    activeSubtitleRef.current = '';
-    setSubtitleCues(cues);
-    setSubtitleName(name);
-    setSubtitleEnabled(cues.length > 0);
-    setSubtitleText('');
-    addToast(
-      cues.length > 0 ? `زیرنویس «${name}» با ${cues.length} بخش بارگذاری شد` : 'زیرنویس معتبری یافت نشد',
-      cues.length > 0 ? 'success' : 'error'
-    );
-  };
-
-  // Load raw parsed cues (e.g. extracted from an MKV) directly
-  const loadSubtitleCues = (cues, name) => {
-    subtitleSourceRef.current = cuesToSrt(cues);
-    activeSubtitleRef.current = '';
-    setSubtitleCues(cues);
-    setSubtitleName(name);
-    setSubtitleEnabled(cues.length > 0);
-    setSubtitleText('');
-    addToast(
-      cues.length > 0 ? `زیرنویس «${name}» با ${cues.length} بخش بارگذاری شد` : 'زیرنویس معتبری یافت نشد',
-      cues.length > 0 ? 'success' : 'error'
-    );
-  };
-
-  const loadSubtitleUrl = async (url) => {
-    try {
-      const res = await fetch(url);
-      if (!res.ok) throw new Error(`HTTP ${res.status}`);
-      const buf = new Uint8Array(await res.arrayBuffer());
-      const text = decodeSubtitleBytes(buf);
-      loadSubtitleText(text, url.split('/').pop().split('?')[0] || 'زیرنویس');
-    } catch {
-      addToast('بارگذاری زیرنویس ناموفق بود (CORS یا لینک نامعتبر)', 'error');
-    }
-  };
-
-  const handleSubtitleFile = (file) => {
-    if (!file) return;
-    const reader = new FileReader();
-    reader.onload = () => loadSubtitleText(decodeSubtitleBytes(new Uint8Array(reader.result)), file.name);
-    reader.readAsArrayBuffer(file);
-  };
-
-  // Cue tracking loop (rAF + binary search: smooth, no jank, no O(n) scan)
-  useEffect(() => {
-    if (!subtitleEnabled || subtitleCues.length === 0) return;
-    let raf;
-    const loop = () => {
-      const v = videoRef.current;
-      if (v) {
-        const t = v.currentTime;
-        // Binary search for the last cue whose start <= t (cues are sorted)
-        let lo = 0;
-        let hi = subtitleCues.length - 1;
-        let best = -1;
-        while (lo <= hi) {
-          const mid = (lo + hi) >> 1;
-          if (subtitleCues[mid].start <= t) {
-            best = mid;
-            lo = mid + 1;
-          } else {
-            hi = mid - 1;
-          }
-        }
-        const cue = best >= 0 && t < subtitleCues[best].end ? subtitleCues[best] : null;
-        const text = cue ? cue.text : '';
-        if (text !== activeSubtitleRef.current) {
-          activeSubtitleRef.current = text;
-          setSubtitleText(text);
-        }
-      }
-      raf = requestAnimationFrame(loop);
-    };
-    raf = requestAnimationFrame(loop);
-    return () => cancelAnimationFrame(raf);
-  }, [subtitleEnabled, subtitleCues]);
+  // --- Subtitles: loading/extraction/cue tracking live in useSubtitles.js ---
 
   // --- Manual re-sync (no page reload: everyone aligns to the host again) ---
   const syncNow = () => {
@@ -1900,21 +1420,6 @@ export const Room = ({ roomId, userName, isHost, onLeave }) => {
     setTimeout(() => setIsCopied(false), 2000);
   };
 
-  // --- Subtitle download (export current subtitle text) ---
-  const downloadSubtitle = () => {
-    if (subtitleCues.length === 0) return;
-    const name = (subtitleName || 'subtitle.srt').replace(/\.(srt|vtt|txt)$/i, '') + '.srt';
-    const content = subtitleSourceRef.current || cuesToSrt(subtitleCues);
-    const blob = new Blob([content], { type: 'text/plain' });
-    const objUrl = URL.createObjectURL(blob);
-    const a = document.createElement('a');
-    a.href = objUrl;
-    a.download = name;
-    a.click();
-    setTimeout(() => URL.revokeObjectURL(objUrl), 10000);
-    addToast(`زیرنویس «${name}» دانلود شد`, 'success');
-  };
-
   // --- Keyboard shortcuts (single listener; latest handler via ref) ---
   const keyHandlerRef = useRef(null);
   keyHandlerRef.current = (e) => {
@@ -2007,21 +1512,7 @@ export const Room = ({ roomId, userName, isHost, onLeave }) => {
         ? 'در انتظار مهمان‌ها...'
         : 'در حال برقراری اتصال P2P...';
 
-  const iceTypeLabel = netStats?.iceType === 'relay'
-    ? 'رله (TURN)'
-    : netStats?.iceType === 'srflx'
-      ? 'مستقیم (P2P)'
-      : netStats?.iceType === 'host'
-        ? 'مستقیم (LAN)'
-        : '—';
-
-  const signalingHost = ACTIVE_SIGNALING.includes('://')
-    ? new URL(ACTIVE_SIGNALING).host
-    : ACTIVE_SIGNALING;
-
   const isCurrentUser = (user) => user.id === 'self' || (peerRef.current && user.id === peerRef.current.id);
-
-  const EMOJIS = ['❤️', '🔥', '😂', '👏', '😮', '🎉', '🍿'];
 
   return (
     <div className="h-dvh flex flex-col bg-black text-gray-100 relative overflow-hidden">
@@ -2121,7 +1612,7 @@ export const Room = ({ roomId, userName, isHost, onLeave }) => {
             ) : (
               <video
                 ref={videoRef}
-                src={videoUrl}
+                src={useMkvEngine ? undefined : videoUrl}
                 playsInline
                 preload="auto"
                 aria-label="ویدیو اتاق"
@@ -2131,7 +1622,12 @@ export const Room = ({ roomId, userName, isHost, onLeave }) => {
                 onLoadedMetadata={() => {
                   const v = videoRef.current;
                   if (v) {
-                    setDuration(v.duration);
+                    // MSE reports duration only at endOfStream — use the
+                    // engine's duration (from the MKV Info element) meanwhile.
+                    const d = Number.isFinite(v.duration) && v.duration > 0
+                      ? v.duration
+                      : (mkvEngineRef.current?.duration || 0);
+                    setDuration(d);
                     v.playbackRate = userSpeedRef.current;
                     v.volume = volume;
                     v.muted = isMuted;
@@ -2192,8 +1688,14 @@ export const Room = ({ roomId, userName, isHost, onLeave }) => {
                   این فرمت/کدک توسط مرورگر شما پشتیبانی نمی‌شود
                 </p>
                 <p className="text-[10px] md:text-xs text-gray-500 font-persian max-w-md">
-                  MP4 (H.264) و WebM (VP9/AV1) بهترین سازگاری را دارند؛ MKV در صورت داشتن کدک پشتیبانی‌شده پخش می‌شود.
+                  {engineErrorMsg || 'MP4 (H.264) و WebM (VP9/AV1) بهترین سازگاری را دارند؛ MKV در صورت داشتن کدک پشتیبانی‌شده پخش می‌شود.'}
                 </p>
+                {enginePhase && enginePhase !== 'streaming' && !engineErrorMsg && (
+                  <p className="text-[10px] md:text-xs text-gray-400 font-persian flex items-center gap-1">
+                    <Loader2 className="w-3 h-3 animate-spin" />
+                    در حال آماده‌سازی پخش MKV...
+                  </p>
+                )}
                 {isMkvLike(videoUrl) && (
                   <p className="text-[10px] md:text-xs text-amber-400 font-persian max-w-md">
                     مرورگرهای iOS (سافاری) قابلیت پخش فرمت MKV را ندارند — فایل را دانلود کنید یا با «پخش در پلیر سیستم» در پلیر QuickTime باز کنید، یا برای پخش داخل برنامه به MP4 تبدیل کنید.
@@ -2201,7 +1703,7 @@ export const Room = ({ roomId, userName, isHost, onLeave }) => {
                 )}
                 <div className="flex flex-wrap justify-center gap-2">
                   <button
-                    onClick={() => setCodecError(false)}
+                    onClick={() => { setCodecError(false); setEngineErrorMsg(null); }}
                     className="btn-primary text-xs md:text-sm"
                   >
                     <Film className="w-4 h-4" />
@@ -2457,462 +1959,46 @@ export const Room = ({ roomId, userName, isHost, onLeave }) => {
             {/* --- In-wrapper modals: stay visible inside fullscreen --- */}
 
             {/* Change Video Modal (URL + Subtitles) */}
-            <Modal isOpen={isUrlModalOpen} onClose={() => setIsUrlModalOpen(false)} title="تغییر ویدیو و زیرنویس">
-              <div className="space-y-4">
-                <p className="text-sm text-gray-300 font-persian">لینک مستقیم ویدیو را وارد کنید (MP4/WebM/MKV):</p>
-
-                <form onSubmit={handleCustomUrlSubmit} className="space-y-3">
-                  <label className="block text-xs text-gray-400">لینک مستقیم (URL):</label>
-                  <div className="flex gap-2">
-                    <AnimatedInput
-                      type="url"
-                      value={customUrlInput}
-                      onChange={(e) => setCustomUrlInput(e.target.value)}
-                      placeholder="https://.../movie.mp4"
-                      dir="ltr"
-                      autoFocus
-                      fieldClassName="py-2 px-5 text-xs"
-                      wrapperClassName="flex-1"
-                    />
-                    <button type="submit" className="btn-primary py-2 px-4 text-xs whitespace-nowrap shrink-0">
-                      پخش
-                    </button>
-                  </div>
-                  <p className="text-[10px] text-gray-500">
-                    پس از تایید، برای هماهنگی همهٔ کاربران {BUFFER_SECONDS} ثانیه صبر می‌شود و سپس پخش شروع می‌شود.
-                  </p>
-                </form>
-
-                <div className="pt-3 border-t border-white/10 space-y-3">
-                  <label className="block text-xs text-gray-400">زیرنویس (SRT / WebVTT):</label>
-                  <div className="flex gap-2">
-                    <AnimatedInput
-                      type="url"
-                      value={subUrlInput}
-                      onChange={(e) => setSubUrlInput(e.target.value)}
-                      placeholder="https://.../movie.srt"
-                      dir="ltr"
-                      fieldClassName="py-2 px-5 text-xs"
-                      wrapperClassName="flex-1"
-                    />
-                    <button
-                      onClick={() => {
-                        if (!subUrlInput.trim()) return;
-                        loadSubtitleUrl(subUrlInput.trim());
-                        setSubUrlInput('');
-                      }}
-                      className="btn-secondary py-2 px-4 text-xs whitespace-nowrap shrink-0"
-                    >
-                      بارگذاری
-                    </button>
-                  </div>
-                  <div className="flex items-center justify-between gap-2">
-                    <label className="btn-secondary flex-1 py-2 text-xs gap-1.5 cursor-pointer">
-                      <Subtitles className="w-3.5 h-3.5 text-red-400" />
-                      آپلود فایل زیرنویس
-                      <input
-                        ref={subtitleFileRef}
-                        type="file"
-                        accept=".srt,.vtt,.ass,.ssa,.txt"
-                        className="hidden"
-                        onChange={(e) => {
-                          handleSubtitleFile(e.target.files?.[0]);
-                          e.target.value = '';
-                        }}
-                      />
-                    </label>
-                    {subtitleName && (
-                      <span className="text-[9px] text-emerald-400 truncate font-mono" dir="ltr">
-                        ✓ {subtitleName}
-                      </span>
-                    )}
-                  </div>
-
-                  <div className="pt-1 space-y-2">
-                    <button
-                      onClick={async () => {
-                        const url = videoUrlRef.current;
-                        if (!url) {
-                          setMkvError('ابتدا یک ویدیو انتخاب کنید');
-                          return;
-                        }
-                        setMkvLoading(true);
-                        setMkvError('');
-                        setMkvTracks([]);
-                        try {
-                          let res;
-                          try {
-                            res = await fetch(url, {
-                              mode: 'cors',
-                              signal: AbortSignal.timeout(180000)
-                            });
-                          } catch (fetchErr) {
-                            throw fetchErr;
-                          }
-                          if (res.type === 'opaque') throw new TypeError('CORS blocked');
-                          if (!res.ok) throw new Error(`HTTP ${res.status}: ${res.statusText}`);
-                          const buf = await res.arrayBuffer();
-                          const tracks = await extractMkvSubtitles(buf);
-                          setMkvTracks(tracks);
-                          if (tracks.length === 0) setMkvError('زیرنویس داخلی در این ویدیو یافت نشد');
-                          else addToast(`${tracks.length} ترک زیرنویس یافت شد`, 'success');
-                        } catch (e) {
-                          const msg = e?.message || String(e);
-                          const corsBlocked = e instanceof TypeError
-                            || msg.includes('CORS')
-                            || msg.includes('cross-origin')
-                            || msg.includes('Failed to fetch')
-                            || msg.includes('NetworkError');
-                          if (corsBlocked) {
-                            setMkvError('CORS blocked: سرور ویدیو اجازه خواندن مستقیم را نمی‌دهد. فایل را دانلود و آپلود کنید یا از لینک مستقیم SRT استفاده کنید.');
-                          } else {
-                            setMkvError('استخراج ناموفق بود: ' + msg);
-                          }
-                        } finally {
-                          setMkvLoading(false);
-                        }
-                      }}
-                      disabled={mkvLoading}
-                      className="btn-secondary w-full text-xs gap-1.5 disabled:opacity-50"
-                    >
-                      {mkvLoading ? <Loader2 className="w-3.5 h-3.5 animate-spin" /> : <Film className="w-3.5 h-3.5 text-red-400" />}
-                      استخراج زیرنویس داخلی (MKV)
-                    </button>
-                    {mkvError && <p className="text-[10px] text-red-400">{mkvError}</p>}
-                    {mkvTracks.length > 0 && (
-                      <div className="space-y-1.5">
-                        {mkvTracks.map((t) => (
-                          <div key={t.trackNumber} className="flex items-center justify-between gap-2 glass-card p-2 rounded-lg">
-                            <span className="text-[10px] text-gray-300 truncate" dir="ltr">
-                              #{t.trackNumber} · {t.type}{t.language ? ` · ${t.language}` : ''}{t.name ? ` · ${t.name}` : ''}
-                            </span>
-                            <button
-                              onClick={() => loadSubtitleCues(t.cues, `${t.language || 'sub'} (MKV #${t.trackNumber})`)}
-                              className="btn-primary py-1 px-2 text-[10px] shrink-0"
-                            >
-                              بارگذاری
-                            </button>
-                          </div>
-                        ))}
-                      </div>
-                    )}
-                  </div>
-                  <div className="pt-1">
-                    <label className="btn-secondary w-full text-xs gap-1.5 cursor-pointer">
-                      <Subtitles className="w-3.5 h-3.5 text-red-400" />
-                      استخراج از فایل MKV (آپلود — بدون محدودیت CORS)
-                      <input
-                        type="file"
-                        accept=".mkv,.mks"
-                        className="hidden"
-                        onChange={async (e) => {
-                          const file = e.target.files?.[0];
-                          e.target.value = '';
-                          if (!file) return;
-                          setMkvLoading(true);
-                          setMkvError('');
-                          setMkvTracks([]);
-                          try {
-                            const buf = await file.arrayBuffer();
-                            const tracks = await extractMkvSubtitles(buf);
-                            setMkvTracks(tracks);
-                            if (tracks.length === 0) setMkvError('زیرنویس داخلی در این ویدیو یافت نشد');
-                            else addToast(`${tracks.length} ترک زیرنویس یافت شد`, 'success');
-                          } catch (err) {
-                            setMkvError('استخراج ناموفق بود: ' + (err?.message || String(err)));
-                          } finally {
-                            setMkvLoading(false);
-                          }
-                        }}
-                      />
-                    </label>
-                  </div>
-                </div>
-              </div>
-            </Modal>
+            <ChangeVideoModal
+              isOpen={isUrlModalOpen}
+              onClose={() => setIsUrlModalOpen(false)}
+              customUrlInput={customUrlInput}
+              onCustomUrlChange={setCustomUrlInput}
+              onCustomUrlSubmit={handleCustomUrlSubmit}
+              subUrlInput={subUrlInput}
+              onSubUrlChange={setSubUrlInput}
+              onLoadSubtitleUrl={loadSubtitleUrl}
+              subtitleFileRef={subtitleFileRef}
+              onSubtitleFile={handleSubtitleFile}
+              subtitleName={subtitleName}
+              mkvTracks={mkvTracks}
+              mkvLoading={mkvLoading}
+              mkvError={mkvError}
+              onExtractFromUrl={extractMkvFromUrl}
+              onExtractFromFile={extractMkvFromFile}
+              onLoadMkvTrack={loadSubtitleCues}
+            />
 
             {/* Subtitle Settings Modal */}
-            <Modal
+            <SubtitleSettingsModal
               isOpen={subtitleModalOpen}
               onClose={() => setSubtitleModalOpen(false)}
-              title="تنظیمات زیرنویس"
-            >
-              <div className="space-y-5">
-                {/* Enable/Disable toggle */}
-                <div className="flex items-center justify-between p-3 glass-card rounded-xl">
-                  <div className="flex items-center gap-3">
-                    <div className="w-10 h-10 rounded-xl bg-red-600/20 border border-red-500/30 flex items-center justify-center">
-                      <Subtitles className="w-5 h-5 text-red-400" />
-                    </div>
-                    <div>
-                      <h4 className="font-bold text-white">زیرنویس</h4>
-                      <p className="text-[10px] text-gray-400">فعال/غیرفعال کردن نمایش زیرنویس</p>
-                    </div>
-                  </div>
-                  <button
-                    onClick={() => setSubtitleEnabled((s) => !s)}
-                    aria-label="فعال/غیرفعال کردن زیرنویس"
-                    className={`relative w-12 h-7 rounded-full transition-all ${subtitleEnabled ? 'bg-red-500' : 'bg-gray-600'}`}
-                    role="switch"
-                    aria-checked={subtitleEnabled}
-                  >
-                    <span
-                      className={`absolute top-0.5 bottom-0.5 w-6 rounded-full bg-white transition-transform shadow-lg ${subtitleEnabled ? 'translate-x-5' : 'translate-x-0.5'}`}
-                    />
-                  </button>
-                </div>
-
-                <div className="border-t border-white/5 pt-2 space-y-4">
-                  {/* Font Size */}
-                  <div className="glass-card p-4 rounded-xl">
-                    <div className="flex items-center justify-between mb-3">
-                      <div className="flex items-center gap-2">
-                        <Type className="w-5 h-5 text-red-400" />
-                        <span className="font-medium text-white">اندازه فونت</span>
-                      </div>
-                      <span className="text-sm font-mono text-red-400 bg-red-500/10 px-2 py-0.5 rounded">
-                        {subtitleSettings.fontSize}px
-                      </span>
-                    </div>
-                    <div className="flex items-center gap-3">
-                      <button
-                        onClick={() => setSubtitleSettings((s) => ({ ...s, fontSize: Math.max(12, s.fontSize - 2) }))}
-                        aria-label="کاهش اندازه فونت"
-                        className="p-2 rounded-lg bg-red-500/20 hover:bg-red-500/30 text-red-400 transition-colors"
-                      >
-                        <Minus className="w-5 h-5" />
-                      </button>
-                      <input
-                        type="range"
-                        min="12"
-                        max="48"
-                        step="2"
-                        value={subtitleSettings.fontSize}
-                        onChange={(e) => setSubtitleSettings((s) => ({ ...s, fontSize: Number(e.target.value) }))}
-                        aria-label="اندازه فونت زیرنویس"
-                        dir="ltr"
-                        className="flex-1 neon-range"
-                      />
-                      <button
-                        onClick={() => setSubtitleSettings((s) => ({ ...s, fontSize: Math.min(48, s.fontSize + 2) }))}
-                        aria-label="افزایش اندازه فونت"
-                        className="p-2 rounded-lg bg-red-500/20 hover:bg-red-500/30 text-red-400 transition-colors"
-                      >
-                        <Plus className="w-5 h-5" />
-                      </button>
-                    </div>
-                  </div>
-
-                  {/* Subtitle Font */}
-                  <div className="glass-card p-4 rounded-xl">
-                    <div className="flex items-center gap-2 mb-3">
-                      <Type className="w-5 h-5 text-purple-400" />
-                      <span className="font-medium text-white">فونت زیرنویس</span>
-                    </div>
-                    <Select
-                      value={subtitleSettings.fontFamily}
-                      onChange={(v) => setSubtitleSettings((s) => ({ ...s, fontFamily: v }))}
-                      options={SUBTITLE_FONTS}
-                      label="فونت"
-                    />
-                  </div>
-
-                  {/* Font Color */}
-                  <div className="glass-card p-4 rounded-xl">
-                    <div className="flex items-center justify-between mb-3">
-                      <div className="flex items-center gap-2">
-                        <Palette className="w-5 h-5 text-red-400" />
-                        <span className="font-medium text-white">رنگ فونت</span>
-                      </div>
-                      <input
-                        type="color"
-                        value={subtitleSettings.fontColor}
-                        onChange={(e) => setSubtitleSettings((s) => ({ ...s, fontColor: e.target.value }))}
-                        aria-label="رنگ فونت زیرنویس"
-                        className="w-10 h-10 rounded-lg border border-white/10 cursor-pointer"
-                      />
-                    </div>
-                    <div className="flex gap-2 flex-wrap">
-                      {['#ffffff', '#ffeb3b', '#00e676', '#ff1744', '#2979ff', '#ff9100'].map((color) => (
-                        <button
-                          key={color}
-                          onClick={() => setSubtitleSettings((s) => ({ ...s, fontColor: color }))}
-                          aria-label={`رنگ ${color}`}
-                          className={`w-8 h-8 rounded-lg border-2 transition-all ${subtitleSettings.fontColor === color ? 'border-red-400 scale-110' : 'border-white/10 hover:border-red-500/50'}`}
-                          style={{ backgroundColor: color }}
-                        />
-                      ))}
-                    </div>
-                  </div>
-
-                  {/* Background Color */}
-                  <div className="glass-card p-4 rounded-xl">
-                    <div className="flex items-center justify-between mb-3">
-                      <div className="flex items-center gap-2">
-                        <div className="w-5 h-5 rounded bg-gradient-to-r from-red-500 to-orange-500" />
-                        <span className="font-medium text-white">پس‌زمینه</span>
-                      </div>
-                      <input
-                        type="color"
-                        value={subtitleSettings.backgroundColor === 'transparent' ? '#000000' : subtitleSettings.backgroundColor}
-                        onChange={(e) => setSubtitleSettings((s) => ({ ...s, backgroundColor: e.target.value }))}
-                        aria-label="رنگ پس‌زمینه زیرنویس"
-                        className="w-10 h-10 rounded-lg border border-white/10 cursor-pointer"
-                      />
-                    </div>
-                    <div className="flex gap-2 flex-wrap">
-                      {['#000000', '#1c1c24', '#8b0000', 'transparent'].map((bg) => (
-                        <button
-                          key={bg}
-                          onClick={() => setSubtitleSettings((s) => ({ ...s, backgroundColor: bg }))}
-                          aria-label={`پس‌زمینه ${bg === 'transparent' ? 'شفاف' : bg}`}
-                          className={`w-20 h-10 rounded-lg border-2 flex items-center justify-center text-[10px] font-mono transition-all ${subtitleSettings.backgroundColor === bg ? 'border-red-400 scale-110' : 'border-white/10 hover:border-red-500/50'}`}
-                          style={{ backgroundColor: bg }}
-                        >
-                          {bg === 'transparent' ? 'بدون' : ''}
-                        </button>
-                      ))}
-                    </div>
-                  </div>
-
-                  {/* Background Blur */}
-                  <div className="glass-card p-4 rounded-xl">
-                    <div className="flex items-center justify-between mb-3">
-                      <div className="flex items-center gap-2">
-                        <SlidersHorizontal className="w-5 h-5 text-red-400" />
-                        <span className="font-medium text-white">بلور پس‌زمینه</span>
-                      </div>
-                      <span className="text-sm font-mono text-red-400 bg-red-500/10 px-2 py-0.5 rounded">
-                        {subtitleSettings.backgroundBlur}px
-                      </span>
-                    </div>
-                    <input
-                      type="range"
-                      min="0"
-                      max="20"
-                      step="1"
-                      value={subtitleSettings.backgroundBlur}
-                      onChange={(e) => setSubtitleSettings((s) => ({ ...s, backgroundBlur: Number(e.target.value) }))}
-                      aria-label="میزان بلور پس‌زمینه"
-                      dir="ltr"
-                      className="neon-range"
-                    />
-                  </div>
-
-                  {/* Vertical Position */}
-                  <div className="glass-card p-4 rounded-xl">
-                    <div className="flex items-center justify-between mb-3">
-                      <div className="flex items-center gap-2">
-                        <div className="w-5 h-5 rounded border-2 border-red-400 relative">
-                          <div className="absolute bottom-0 left-1/2 -translate-x-1/2 w-1.5 h-1.5 bg-red-400 rounded-full" />
-                        </div>
-                        <span className="font-medium text-white">موقعیت عمودی</span>
-                      </div>
-                      <span className="text-sm font-mono text-red-400 bg-red-500/10 px-2 py-0.5 rounded">
-                        {subtitleSettings.verticalOffset}px از پایین
-                      </span>
-                    </div>
-                    <input
-                      type="range"
-                      min="8"
-                      max="200"
-                      step="4"
-                      value={subtitleSettings.verticalOffset}
-                      onChange={(e) => setSubtitleSettings((s) => ({ ...s, verticalOffset: Number(e.target.value) }))}
-                      aria-label="موقعیت عمودی زیرنویس"
-                      dir="ltr"
-                      className="neon-range"
-                    />
-                    <div className="flex justify-between text-[10px] text-gray-500 mt-1">
-                      <span>بالا (8px)</span>
-                      <span>پایین (200px)</span>
-                    </div>
-                  </div>
-
-                  {/* Text Shadow Toggle */}
-                  <div className="flex items-center justify-between p-3 glass-card rounded-xl">
-                    <div className="flex items-center gap-3">
-                      <div className="w-10 h-10 rounded-xl bg-purple-600/20 border border-purple-500/30 flex items-center justify-center">
-                        <Type className="w-5 h-5 text-purple-400" />
-                      </div>
-                      <div>
-                        <h4 className="font-bold text-white">سایه متن</h4>
-                        <p className="text-[10px] text-gray-400">افزودن سایه برای خوانایی بهتر</p>
-                      </div>
-                    </div>
-                    <button
-                      onClick={() => setSubtitleSettings((s) => ({ ...s, textShadow: !s.textShadow }))}
-                      aria-label="فعال/غیرفعال کردن سایه متن"
-                      className={`relative w-12 h-7 rounded-full transition-all ${subtitleSettings.textShadow ? 'bg-purple-500' : 'bg-gray-600'}`}
-                      role="switch"
-                      aria-checked={subtitleSettings.textShadow}
-                    >
-                      <span
-                        className={`absolute top-0.5 bottom-0.5 w-6 rounded-full bg-white transition-transform shadow-lg ${subtitleSettings.textShadow ? 'translate-x-5' : 'translate-x-0.5'}`}
-                      />
-                    </button>
-                  </div>
-
-                  {/* Reset Button */}
-                  <button
-                    onClick={() => setSubtitleSettings({
-                      fontSize: 20,
-                      fontColor: '#ffffff',
-                      backgroundColor: '#000000',
-                      backgroundBlur: 4,
-                      verticalOffset: 24,
-                      fontFamily: 'inherit',
-                      textShadow: true,
-                    })}
-                    className="w-full btn-secondary text-sm gap-2"
-                  >
-                    <SlidersHorizontal className="w-4 h-4" />
-                    بازنشانی به پیش‌فرض
-                  </button>
-                </div>
-              </div>
-            </Modal>
+              settings={subtitleSettings}
+              onChange={setSubtitleSettings}
+              subtitleEnabled={subtitleEnabled}
+              onToggleSubtitle={() => setSubtitleEnabled((s) => !s)}
+              onReset={resetSubtitleSettings}
+            />
 
             {/* Chat Modal */}
-            <Modal
+            <ChatModal
               isOpen={chatModalOpen}
               onClose={() => setChatModalOpen(false)}
-              title="چت اتاق"
-            >
-              <div className="space-y-4">
-                <div
-                  ref={chatModalScrollRef}
-                  className="flex-1 min-h-0 max-h-[60vh] overflow-y-auto space-y-2 p-1 chat-scroll"
-                >
-                  {messages.length === 0 ? (
-                    <p className="text-center text-[10px] text-gray-500 py-8">هنوز پیامی ارسال نشده است</p>
-                  ) : (
-                    messages.map((msg) => (
-                      <div key={msg.id} className="glass-card p-3 rounded-xl border-l-2 border-l-red-500/40 animate-fade-in">
-                        <div className="flex items-center justify-between mb-1">
-                          <span className="font-bold text-red-400 text-xs">{msg.sender}</span>
-                          <span className="text-[9px] text-gray-500">{msg.time}</span>
-                        </div>
-                        <p className="text-gray-200 text-sm break-words">{msg.text}</p>
-                      </div>
-                    ))
-                  )}
-                </div>
-                <form onSubmit={sendChatMessage} className="flex items-center gap-2 shrink-0">
-                  <AnimatedInput
-                    value={chatInput}
-                    onChange={(e) => setChatInput(e.target.value)}
-                    placeholder="پیام خود را بنویسید..."
-                    autoFocus
-                    fieldClassName="py-2 px-5 text-sm"
-                    wrapperClassName="flex-1"
-                  />
-                  <button type="submit" aria-label="ارسال پیام" className="btn-primary p-2.5 rounded-xl shrink-0">
-                    <Send className="w-5 h-5" />
-                  </button>
-                </form>
-              </div>
-            </Modal>
+              messages={messages}
+              chatInput={chatInput}
+              onChatInputChange={setChatInput}
+              onSendMessage={sendChatMessage}
+            />
           </div>
 
           {/* Quick Reactions Bar */}
@@ -3069,111 +2155,26 @@ export const Room = ({ roomId, userName, isHost, onLeave }) => {
       </footer>
 
       {/* Share Room Modal */}
-      <Modal isOpen={isShareModalOpen} onClose={() => setIsShareModalOpen(false)} title="دعوت دوستان به اتاق">
-        <div className="space-y-4">
-          <p className="text-sm text-gray-300 font-persian">
-            برای تماشای همزمان فیلم با دوستانتان، لینک زیر یا کد اتاق را برای آن‌ها ارسال کنید:
-          </p>
-
-          <div className="p-3.5 rounded-2xl bg-black/60 border border-red-500/20 flex items-center justify-between gap-2">
-            <span className="font-mono text-xs md:text-sm text-red-300 truncate max-w-[300px]" dir="ltr">{window.location.href}</span>
-            <button
-              onClick={copyRoomLink}
-              className="btn-primary py-1.5 px-3 text-xs gap-1.5 shrink-0"
-            >
-              {isCopied ? <Check className="w-4 h-4" /> : <LinkIcon className="w-4 h-4" />}
-              <span>{isCopied ? 'کپی شد!' : 'کپی لینک'}</span>
-            </button>
-          </div>
-
-          <div className="text-center pt-2">
-            <span className="text-xs text-gray-500 font-mono">کد یکتای اتاق: <strong className="text-red-400">{roomId}</strong></span>
-          </div>
-
-          <div className="rounded-xl bg-black/40 border border-white/5 p-3 space-y-1.5 text-[11px] font-mono text-gray-400" dir="ltr">
-            <div className="flex items-center justify-between">
-              <span>signaling</span>
-              <span className="text-emerald-400">{signalingHost}</span>
-            </div>
-            <div className="flex items-center justify-between">
-              <span>turn relay</span>
-              <span className={ACTIVE_TURN || xirsysTurnActive ? 'text-emerald-400' : 'text-gray-500'}>
-                {ACTIVE_TURN
-                  ? ACTIVE_TURN.split(':')[1] + ':' + ACTIVE_TURN.split(':')[2]
-                  : xirsysTurnActive
-                    ? 'xirsys (خودکار)'
-                    : 'خاموش (فقط P2P)'}
-              </span>
-            </div>
-            <div className="flex items-center justify-between">
-              <span>rtt (تاخیر)</span>
-              <span className={netStats?.rtt != null ? 'text-emerald-400' : 'text-gray-500'}>
-                {netStats?.rtt != null ? `${netStats.rtt}ms` : '—'}
-              </span>
-            </div>
-            <div className="flex items-center justify-between">
-              <span>clock offset (اختلاف ساعت)</span>
-              <span className={netStats?.offsetMs != null ? 'text-emerald-400' : 'text-gray-500'}>
-                {netStats?.offsetMs != null ? `${netStats.offsetMs}ms` : '—'}
-              </span>
-            </div>
-            <div className="flex items-center justify-between">
-              <span>مسیر اتصال</span>
-              <span className={netStats?.iceType ? 'text-emerald-400' : 'text-gray-500'}>
-                {iceTypeLabel}
-              </span>
-            </div>
-          </div>
-        </div>
-      </Modal>
+      <ShareModal
+        isOpen={isShareModalOpen}
+        onClose={() => setIsShareModalOpen(false)}
+        roomId={roomId}
+        isCopied={isCopied}
+        onCopy={copyRoomLink}
+        xirsysTurnActive={xirsysTurnActive}
+        netStats={netStats}
+      />
 
       {/* Manage User Modal */}
-      <Modal
+      <ManageUserModal
         isOpen={manageModalOpen}
         onClose={() => setManageModalOpen(false)}
-        title={selectedUser ? `مدیریت کاربر: ${selectedUser.name}` : 'مدیریت کاربر'}
-      >
-        {selectedUser && (
-          <div className="space-y-4">
-            <div className="glass-card p-4 rounded-2xl flex items-center gap-3">
-              <div className="w-11 h-11 rounded-xl bg-red-600/20 border border-red-500/30 flex items-center justify-center font-bold text-red-300">
-                {selectedUser.name.charAt(0)}
-              </div>
-              <div>
-                <h4 className="font-bold text-sm text-white">{selectedUser.name}</h4>
-                <p className="text-[10px] text-gray-400">
-                  {selectedUser.isHost ? 'میزبان اتاق' : selectedUser.isAdmin ? 'ادمین' : 'عضو اتاق'}
-                </p>
-              </div>
-            </div>
-
-            {isHost && !selectedUser.isHost && (
-              <button
-                onClick={() => toggleAdminRole(selectedUser.id, !selectedUser.isAdmin)}
-                className={`btn-secondary w-full text-sm gap-2 ${selectedUser.isAdmin ? 'hover:border-red-500/70 hover:text-red-400' : ''}`}
-              >
-                {selectedUser.isAdmin
-                  ? <><ShieldOff className="w-4 h-4 text-red-400" /> گرفتن دسترسی ادمین</>
-                  : <><Shield className="w-4 h-4 text-red-400" /> ارتقا به ادمین</>}
-              </button>
-            )}
-
-            {(isHost || (canManage && !selectedUser.isAdmin && !selectedUser.isHost)) && (
-              <button
-                onClick={() => kickUser(selectedUser.id)}
-                className="btn-secondary w-full text-sm gap-2 hover:border-red-500/70 hover:text-red-400 hover:bg-red-500/10"
-              >
-                <UserX className="w-4 h-4 text-red-400" />
-                حذف از اتاق (Kick)
-              </button>
-            )}
-
-            {!canManage && (
-              <p className="text-xs text-gray-500 text-center">فقط میزبان/ادمین می‌تواند دسترسی‌ها را تغییر دهد</p>
-            )}
-          </div>
-        )}
-      </Modal>
+        user={selectedUser}
+        isHost={isHost}
+        canManage={canManage}
+        onToggleAdmin={toggleAdminRole}
+        onKick={kickUser}
+      />
 
     </div>
   );
